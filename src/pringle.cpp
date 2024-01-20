@@ -63,14 +63,14 @@ using Product = d_array_t;
  */
 struct Config
 {
-    int fold = 50;
+    int fold = 1;
     int rk = 1;
     double viscosity = 0.001;
     double cpi = 1.0;
     double spi = 1.0;
     double tsi = 0.1;
     vec_t<double, 3> domain = {0.0, 10.0, 0.01};
-    vec_t<double, 3> trange = {0.0, 0.0};
+    vec_t<double, 2> trange = {0.0, 0.0};
     std::vector<uint> sp = {0, 1};
     std::vector<uint> ts;
     std::string outdir = ".";
@@ -104,50 +104,61 @@ VISITABLE_STRUCT(State, time, iter, mass);
 // }
 
 
+/**
+ * Return the shear profile d(Omega) / d(log R)
+ */
+HD auto keplerian_omega_log_derivative(double R)
+{
+    return -1.5 * sqrt(GM / R / R / R);
+}
 
+/**
+ * Keplerian orbital frequency at radius R
+ */
+HD auto keplerian_omega(double R)
+{
+    return sqrt(GM / R / R / R);
+}
 
-// def keplerian_omega_log_derivative(R):
-//     """
-//     Return the shear profile d(Omega) / d(log R)
-//     """
-//     return -1.5 * sqrt(GM / R**3)
-
-
-// def keplerian_omega(R):
-//     return sqrt(GM / R**3)
-
-
+/**
+ * Specific angular momentum l at radius R
+ */
 HD auto specific_angular_momentum(double R)
 {
     return sqrt(GM * R);
 }
 
+/**
+ * Specific angular momentum derivative, dl/dR, at radius R
+ */
 HD auto specific_angular_momentum_derivative(double R)
 {
     return 0.5 * sqrt(GM / R);
 }
 
-// def radial_velocity(M, R, viscosity, model, t):
-//     """
-//     Return the radial gas velocity at the internal zone interfaces
-
-//     v = (d/dR(R g) + tau) / (sigma R l')
-
-//     where tau is the external torque per unit length.
-//     """
+/**
+ * Return the radial gas velocity at the internal zone interfaces
+ * 
+ * v = (d/dR(R g) + tau) / (sigma R l')
+ * 
+ * where tau is the external torque per unit length.
+ */
+// HD auto radial_velocity(M, R, viscosity, double t)
+// {
 //     Rc = 0.5 * (R[1:] + R[:-1])
-//     s = sigma(M, R)
-//     n = viscosity(Rc)
-//     A = keplerian_omega_log_derivative(Rc)
-//     g = Rc * s * n * A
-//     m = specific_angular_momentum_derivative(R[1:-1])
+//     auto s = sigma(M, R)
+//     auto n = viscosity(Rc)
+//     auto A = keplerian_omega_log_derivative(Rc)
+//     auto g = Rc * s * n * A
+//     auto m = specific_angular_momentum_derivative(R[1:-1])
 
 //     try:
 //         tau = model.external_torque_per_unit_length(M, R, t)
 //     except AttributeError:
 //         tau = 0.0
 
-//     return (diff(Rc * g) / diff(Rc) + tau) / (0.5 * (s[1:] + s[:-1]) * m * R[1:-1])
+//     return (diff(Rc * g) / diff(Rc) + tau) / (0.5 * (s[1:] + s[:-1]) * m * R[1:-1]);
+// }
 
 
 
@@ -198,26 +209,39 @@ static auto cell_surface_areas(const Config& config)
 
 static void update_state(State& state, const Config& config)
 {
+    auto rf = face_coordinates(config);
     auto rc = cell_coordinates(config);
+    auto dr = cell_lengths(config);
+    auto da = cell_surface_areas(config);
     auto ni = rc.size();
     auto iv = range(ni + 1);
     auto ic = range(ni);
     auto interior_faces = iv.space().contract(1);
     auto interior_cells = ic.space().contract(1);
-    auto dr = cell_lengths(config);
-    auto dt = min(dr) * 0.1; // TODO
+    auto dt = min(dr) * 0.01; // TODO
     auto dm = state.mass;
-    auto da = cell_surface_areas(config);
+    auto nu = config.viscosity;
     auto sigma = dm / da;
 
-    auto fhat = iv[interior_faces].map([sigma] HD (int i)
+    auto fhat = iv[interior_faces].map([sigma, rf, rc, nu] HD (int i)
     {
-        // auto ul = u[i - 1];
-        // auto ur = u[i];
-        // auto pl = p[i - 1];
-        // auto pr = p[i];
-        // return riemann_hlle(pl, pr, ul, ur);
-        return 0.0;
+        // v = (d/dR(R g) + tau) / (sigma R l')
+        auto r = rf[i];
+        auto m = specific_angular_momentum_derivative(r);
+        auto pi = M_PI;
+        auto rm = rc[i - 1];
+        auto rp = rc[i + 0];
+        auto Ap = keplerian_omega_log_derivative(rp);
+        auto Am = keplerian_omega_log_derivative(rm);
+        auto sigma_m = sigma[i - 1];
+        auto sigma_p = sigma[i + 0];
+        auto sigma = 0.5 * (sigma_m + sigma_p);
+        auto gm = rp * sigma_p * nu * Ap;
+        auto gp = rm * sigma_m * nu * Am;
+        auto tau = 0.0; // external torque / length
+        auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (sigma * r * m);
+        auto s_hat = (v_hat > 0.0) * sigma_m + (v_hat < 0.0) * sigma_p;
+        return 2.0 * pi * r * v_hat * s_hat;
     }).cache();
 
     auto delta_dm = ic[interior_cells].map([fhat] HD (int i)
@@ -225,7 +249,7 @@ static void update_state(State& state, const Config& config)
         auto fm = fhat[i];
         auto fp = fhat[i + 1];
         return -(fp - fm);
-    }) / dr * dt;
+    }) * dt / dr;
 
     state = State{
         state.time + dt,
@@ -294,7 +318,7 @@ public:
     }
     bool should_continue(const State& state) const override
     {
-        return state.time < config.trange[0];
+        return state.time < config.trange[1];
     }
     uint updates_per_batch() const override
     {
