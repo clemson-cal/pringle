@@ -1,0 +1,11 @@
+{
+    "src": "src",
+    "bin": ".",
+    "build": "build",
+    "vapor": "vapor",
+    "programs": {
+        "pringle": {
+            "deps": ["hdf5"]
+        }
+    }
+}
