@@ -180,6 +180,7 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
     auto g = ic.map([rc, sigma, A, nu] (int i) { return rc[i] * sigma[i] * nu * A[i]; }).cache();
     auto fhat = iv[interior_faces].map([sigma, g, rf, rc] (int i)
     {
+        // v = (d/dR(R g) + tau) / (sigma R l')
         auto r = rf[i];
         auto pi = M_PI;
         auto lp = specific_angular_momentum_derivative(r);
@@ -191,7 +192,6 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
         auto gp = g[i + 0];
         auto tau = 0.0; // external torque / length (zero, for now)
         auto s_hat = 0.5 * (sm + sp);
-        // v = (d/dR(R g) + tau) / (sigma R l')
         auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (s_hat * r * lp);
         if (s_hat < 0.0) {
             throw std::runtime_error(format("found negative sigma at position %f", r));
@@ -215,8 +215,7 @@ static auto next_dm(const d_array_t& dm, const Config& config, double dt)
 static auto next_dm_implicit(const d_array_t& x0, const Config& config, double dt)
 {
     auto f = [x0, &config, dt] (auto x) {
-        auto l = dm_dot(x, config);
-        return x - x0 - l * dt;
+        return x - x0 - dm_dot(x, config) * dt;
     };
     auto eps = 1e-12;
     auto tol = config.tol;
@@ -237,25 +236,23 @@ static auto next_dm_implicit(const d_array_t& x0, const Config& config, double d
 
 static void update_state(State& state, const Config& config, double& timestep)
 {
+    auto nu = config.viscosity;    
     auto dr = cell_lengths(config);
+    auto dt = timestep = config.cfl * (dr * dr / nu)[0];
+
     if (config.method == "implicit") {
-        auto dt = config.cfl * dr[0];
         state = State{
             state.time + dt,
             state.iter + 1.0,
             next_dm_implicit(state.mass, config, dt),
         };
-        timestep = dt;
     }
     else if (config.method == "explicit") {
-        auto nu = config.viscosity;
-        auto dt = config.cfl * (dr * dr / nu)[0];
         state = State{
             state.time + dt,
             state.iter + 1.0,
             next_dm(state.mass, config, dt),
         };
-        timestep = dt;
     }
     else {
         throw std::runtime_error("method must be implicit|explicit");
