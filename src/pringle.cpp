@@ -43,23 +43,11 @@ using Product = d_array_t;
 #define minabs(a, b, c) min3(fabs(a), fabs(b), fabs(c))
 #define GM 1.0
 
-// HD static inline double plm_minmod(
-//     double yl,
-//     double yc,
-//     double yr,
-//     double plm_theta)
-// {
-//     double a = (yc - yl) * plm_theta;
-//     double b = (yr - yl) * 0.5;
-//     double c = (yr - yc) * plm_theta;
-//     return 0.25 * fabs(sign(a) + sign(b)) * (sign(a) + sign(c)) * minabs(a, b, c);
-// }
-
 
 
 
 /**
- * 
+ * User configuration
  */
 struct Config
 {
@@ -69,13 +57,16 @@ struct Config
     double cpi = 1.0;
     double spi = 1.0;
     double tsi = 0.1;
+    double tol = 1e-8;
+    double cfl = 0.1;
     vec_t<double, 3> domain = {0.0, 10.0, 0.01};
     vec_t<double, 2> trange = {0.0, 0.0};
     std::vector<uint> sp = {0, 1};
     std::vector<uint> ts;
     std::string outdir = ".";
+    std::string method = "implicit";
 };
-VISITABLE_STRUCT(Config, fold, rk, viscosity, cpi, spi, tsi, domain, trange, sp, ts, outdir);
+VISITABLE_STRUCT(Config, fold, rk, viscosity, cpi, spi, tsi, tol, cfl, domain, trange, sp, ts, outdir, method);
 
 
 
@@ -94,20 +85,10 @@ VISITABLE_STRUCT(State, time, iter, mass);
 
 
 
-// static State average(const State& a, const State& b, double x)
-// {
-//     return x == 1.0 ? a : State{
-//         (a.time * (1.0 - x) + b.time * x),
-//         (a.iter * (1.0 - x) + b.iter * x),
-//         (a.mass * (1.0 - x) + b.mass * x).cache()
-//     };
-// }
-
-
 /**
  * Return the shear profile d(Omega) / d(log R)
  */
-HD auto keplerian_omega_log_derivative(double R)
+auto keplerian_omega_log_derivative(double R)
 {
     return -1.5 * sqrt(GM / R / R / R);
 }
@@ -115,7 +96,7 @@ HD auto keplerian_omega_log_derivative(double R)
 /**
  * Keplerian orbital frequency at radius R
  */
-HD auto keplerian_omega(double R)
+auto keplerian_omega(double R)
 {
     return sqrt(GM / R / R / R);
 }
@@ -123,7 +104,7 @@ HD auto keplerian_omega(double R)
 /**
  * Specific angular momentum l at radius R
  */
-HD auto specific_angular_momentum(double R)
+auto specific_angular_momentum(double R)
 {
     return sqrt(GM * R);
 }
@@ -131,7 +112,7 @@ HD auto specific_angular_momentum(double R)
 /**
  * Specific angular momentum derivative, dl/dR, at radius R
  */
-HD auto specific_angular_momentum_derivative(double R)
+auto specific_angular_momentum_derivative(double R)
 {
     return 0.5 * sqrt(GM / R);
 }
@@ -164,7 +145,7 @@ static auto cell_coordinates(const Config& config)
 static auto cell_lengths(const Config& config)
 {
     auto rf = face_coordinates(config);
-    auto dl = range(rf.size() - 1).map([rf] HD (int i) {
+    auto dl = range(rf.size() - 1).map([rf] (int i) {
         auto r0 = rf[i];
         auto r1 = rf[i + 1];
         return r1 - r0;
@@ -175,7 +156,7 @@ static auto cell_lengths(const Config& config)
 static auto cell_surface_areas(const Config& config)
 {
     auto rf = face_coordinates(config);
-    auto da = range(rf.size() - 1).map([rf] HD (int i) {
+    auto da = range(rf.size() - 1).map([rf] (int i) {
         auto r0 = rf[i];
         auto r1 = rf[i + 1];
         auto pi = M_PI;
@@ -184,7 +165,7 @@ static auto cell_surface_areas(const Config& config)
     return da;
 }
 
-static auto next_sigma(const State& state, const Config& config, double dt)
+static auto dm_dot(const d_array_t& dm, const Config& config)
 {
     auto rf = face_coordinates(config);
     auto rc = cell_coordinates(config);
@@ -193,17 +174,12 @@ static auto next_sigma(const State& state, const Config& config, double dt)
     auto ic = range(rc.size());
     auto interior_faces = iv.space().contract(1);
     auto interior_cells = ic.space().contract(1);
-    auto dm = state.mass;
     auto nu = config.viscosity;
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
-    auto g = ic.map([rc, sigma, A, nu] (int i)
+    auto g = ic.map([rc, sigma, A, nu] (int i) { return rc[i] * sigma[i] * nu * A[i]; }).cache();
+    auto fhat = iv[interior_faces].map([sigma, g, rf, rc] (int i)
     {
-        return rc[i] * sigma[i] * nu * A[i];
-    }).cache();
-    auto fhat = iv[interior_faces].map([sigma, g, rf, rc] HD (int i)
-    {
-        // v = (d/dR(R g) + tau) / (sigma R l')
         auto r = rf[i];
         auto pi = M_PI;
         auto lp = specific_angular_momentum_derivative(r);
@@ -213,31 +189,77 @@ static auto next_sigma(const State& state, const Config& config, double dt)
         auto sp = sigma[i + 0];
         auto gm = g[i - 1];
         auto gp = g[i + 0];
-        auto tau = 0.0; // external torque / length
+        auto tau = 0.0; // external torque / length (zero, for now)
         auto s_hat = 0.5 * (sm + sp);
+        // v = (d/dR(R g) + tau) / (sigma R l')
         auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (s_hat * r * lp);
+        if (s_hat < 0.0) {
+            throw std::runtime_error(format("found negative sigma at position %f", r));
+        }
         return 2.0 * pi * r * s_hat * v_hat;
     }).cache();
-    auto delta_dm = ic[interior_cells].map([fhat] HD (int i)
+    return zeros<double>(ic.space()).insert(ic[interior_cells].map([fhat] (int i)
     {
         auto fm = fhat[i];
         auto fp = fhat[i + 1];
         return fm - fp;
-    }) * dt;
-    return cache(dm.at(interior_cells) + delta_dm);
+    }));
 }
 
-static void update_state(State& state, const Config& config)
+static auto next_dm(const d_array_t& dm, const Config& config, double dt)
 {
-    auto nu = config.viscosity;
-    auto dr = cell_lengths(config);
-    auto dt = 0.1 * (dr * dr / nu)[0];
+    auto l = dm_dot(dm, config);
+    return cache(dm + l * dt);
+}
 
-    state = State{
-        state.time + dt,
-        state.iter + 1.0,
-        next_sigma(state, config, dt),
+static auto next_dm_implicit(const d_array_t& x0, const Config& config, double dt)
+{
+    auto f = [x0, &config, dt] (auto x) {
+        auto l = dm_dot(x, config);
+        return x - x0 - l * dt;
     };
+    auto eps = 1e-12;
+    auto tol = config.tol;
+    auto x1 = next_dm(x0, config, dt);
+    auto x2 = cache(x1 - f(x1) * (x1 - x0) / (f(x1) - f(x0) + eps));
+    auto iter = 0;
+    while (max(f(x2)) > tol) {
+        auto x3 = cache(x2 - f(x2) * (x2 - x1) / (f(x2) - f(x1) + eps));
+        x1 = x2;
+        x2 = x3;
+        iter += 1;
+        if (iter > 100) {
+            throw std::runtime_error("implicit update is not converging, try a larger tol");
+        }
+    }
+    return x2;
+}
+
+static void update_state(State& state, const Config& config, double& timestep)
+{
+    auto dr = cell_lengths(config);
+    if (config.method == "implicit") {
+        auto dt = config.cfl * dr[0];
+        state = State{
+            state.time + dt,
+            state.iter + 1.0,
+            next_dm_implicit(state.mass, config, dt),
+        };
+        timestep = dt;
+    }
+    else if (config.method == "explicit") {
+        auto nu = config.viscosity;
+        auto dt = config.cfl * (dr * dr / nu)[0];
+        state = State{
+            state.time + dt,
+            state.iter + 1.0,
+            next_dm(state.mass, config, dt),
+        };
+        timestep = dt;
+    }
+    else {
+        throw std::runtime_error("method must be implicit|explicit");
+    }
 }
 
 
@@ -275,10 +297,10 @@ public:
     }
     void initial_state(State& state) const override
     {
-        auto initial_sigma = [*this] HD (double r)
+        auto initial_sigma = [*this] (double r)
         {
             auto Mdot = -1.0;
-            auto Jdot =  0.0;
+            auto Jdot = -1.0;
             auto pi = M_PI;
             auto nu = config.viscosity;
             auto j = specific_angular_momentum(r);
@@ -296,7 +318,7 @@ public:
     }
     void update(State& state) const override
     {
-        update_state(state, config);
+        update_state(state, config, timestep);
     }
     bool should_continue(const State& state) const override
     {
@@ -355,11 +377,14 @@ public:
     }
     vec_t<char, 256> status_message(const State& state, double secs_per_update) const override
     {
-        return format("[%04d] t=%lf Mzps=%.2lf",
+        return format("[%04d] t=%lf dt=%.6e Mzps=%.2lf",
             get_iteration(state),
             get_time(state),
+            timestep,
             1e-6 * state.mass.size() / secs_per_update);
     }
+private:
+    mutable double timestep;
 };
 
 
