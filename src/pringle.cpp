@@ -136,30 +136,6 @@ HD auto specific_angular_momentum_derivative(double R)
     return 0.5 * sqrt(GM / R);
 }
 
-/**
- * Return the radial gas velocity at the internal zone interfaces
- * 
- * v = (d/dR(R g) + tau) / (sigma R l')
- * 
- * where tau is the external torque per unit length.
- */
-// HD auto radial_velocity(M, R, viscosity, double t)
-// {
-//     Rc = 0.5 * (R[1:] + R[:-1])
-//     auto s = sigma(M, R)
-//     auto n = viscosity(Rc)
-//     auto A = keplerian_omega_log_derivative(Rc)
-//     auto g = Rc * s * n * A
-//     auto m = specific_angular_momentum_derivative(R[1:-1])
-
-//     try:
-//         tau = model.external_torque_per_unit_length(M, R, t)
-//     except AttributeError:
-//         tau = 0.0
-
-//     return (diff(Rc * g) / diff(Rc) + tau) / (0.5 * (s[1:] + s[:-1]) * m * R[1:-1]);
-// }
-
 
 
 
@@ -187,22 +163,23 @@ static auto cell_coordinates(const Config& config)
 
 static auto cell_lengths(const Config& config)
 {
-    auto xf = face_coordinates(config);
-    auto dl = range(xf.size() - 1).map([xf] HD (int i) {
-        auto x0 = xf[i];
-        auto x1 = xf[i + 1];
-        return x1 - x0;
+    auto rf = face_coordinates(config);
+    auto dl = range(rf.size() - 1).map([rf] HD (int i) {
+        auto r0 = rf[i];
+        auto r1 = rf[i + 1];
+        return r1 - r0;
     });
     return dl;
 }
 
 static auto cell_surface_areas(const Config& config)
 {
-    auto xf = face_coordinates(config);
-    auto da = range(xf.size() - 1).map([xf] HD (int i) {
-        auto x0 = xf[i];
-        auto x1 = xf[i + 1];
-        return M_PI * (x1 * x1 - x0 * x0);
+    auto rf = face_coordinates(config);
+    auto da = range(rf.size() - 1).map([rf] HD (int i) {
+        auto r0 = rf[i];
+        auto r1 = rf[i + 1];
+        auto pi = M_PI;
+        return pi * (r1 * r1 - r0 * r0);
     });
     return da;
 }
@@ -218,28 +195,28 @@ static void update_state(State& state, const Config& config)
     auto ic = range(ni);
     auto interior_faces = iv.space().contract(1);
     auto interior_cells = ic.space().contract(1);
-    auto dt = min(dr) * 0.01; // TODO
     auto dm = state.mass;
     auto nu = config.viscosity;
     auto sigma = dm / da;
+    auto dt = 0.01 * min(dr * dr / nu);
 
     auto fhat = iv[interior_faces].map([sigma, rf, rc, nu] HD (int i)
     {
         // v = (d/dR(R g) + tau) / (sigma R l')
         auto r = rf[i];
-        auto m = specific_angular_momentum_derivative(r);
         auto pi = M_PI;
         auto rm = rc[i - 1];
         auto rp = rc[i + 0];
         auto Ap = keplerian_omega_log_derivative(rp);
         auto Am = keplerian_omega_log_derivative(rm);
+        auto lp = specific_angular_momentum_derivative(r);
         auto sigma_m = sigma[i - 1];
         auto sigma_p = sigma[i + 0];
         auto sigma = 0.5 * (sigma_m + sigma_p);
-        auto gm = rp * sigma_p * nu * Ap;
-        auto gp = rm * sigma_m * nu * Am;
+        auto gp = rp * sigma_p * nu * Ap;
+        auto gm = rm * sigma_m * nu * Am;
         auto tau = 0.0; // external torque / length
-        auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (sigma * r * m);
+        auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (sigma * r * lp);
         auto s_hat = (v_hat > 0.0) * sigma_m + (v_hat < 0.0) * sigma_p;
         return 2.0 * pi * r * v_hat * s_hat;
     }).cache();
@@ -248,8 +225,8 @@ static void update_state(State& state, const Config& config)
     {
         auto fm = fhat[i];
         auto fp = fhat[i + 1];
-        return -(fp - fm);
-    }) * dt / dr;
+        return fm - fp;
+    }) * dt;
 
     state = State{
         state.time + dt,
@@ -296,12 +273,12 @@ public:
         auto initial_sigma = [*this] HD (double r)
         {
             auto Mdot = -1.0;
-            auto Jdot = -1.0;
+            auto Jdot =  0.0;
             auto pi = M_PI;
             auto nu = config.viscosity;
             auto j = specific_angular_momentum(r);
-            auto s = (Jdot - Mdot * j) / (3 * pi * nu * j);
-            return s;
+            auto sigma = (Jdot - Mdot * j) / (3 * pi * nu * j);
+            return sigma;
         };
         auto da = cell_surface_areas(config);
         auto sigma = cell_coordinates(config).map(initial_sigma);
