@@ -184,54 +184,59 @@ static auto cell_surface_areas(const Config& config)
     return da;
 }
 
-static void update_state(State& state, const Config& config)
+static auto next_sigma(const State& state, const Config& config, double dt)
 {
     auto rf = face_coordinates(config);
     auto rc = cell_coordinates(config);
-    auto dr = cell_lengths(config);
     auto da = cell_surface_areas(config);
-    auto ni = rc.size();
-    auto iv = range(ni + 1);
-    auto ic = range(ni);
+    auto iv = range(rc.size() + 1);
+    auto ic = range(rc.size());
     auto interior_faces = iv.space().contract(1);
     auto interior_cells = ic.space().contract(1);
     auto dm = state.mass;
     auto nu = config.viscosity;
-    auto sigma = dm / da;
-    auto dt = 0.01 * min(dr * dr / nu);
-
-    auto fhat = iv[interior_faces].map([sigma, rf, rc, nu] HD (int i)
+    auto sigma = cache(dm / da);
+    auto A = rc.map(keplerian_omega_log_derivative);
+    auto g = ic.map([rc, sigma, A, nu] (int i)
+    {
+        return rc[i] * sigma[i] * nu * A[i];
+    }).cache();
+    auto fhat = iv[interior_faces].map([sigma, g, rf, rc] HD (int i)
     {
         // v = (d/dR(R g) + tau) / (sigma R l')
         auto r = rf[i];
         auto pi = M_PI;
+        auto lp = specific_angular_momentum_derivative(r);
         auto rm = rc[i - 1];
         auto rp = rc[i + 0];
-        auto Ap = keplerian_omega_log_derivative(rp);
-        auto Am = keplerian_omega_log_derivative(rm);
-        auto lp = specific_angular_momentum_derivative(r);
-        auto sigma_m = sigma[i - 1];
-        auto sigma_p = sigma[i + 0];
-        auto sigma = 0.5 * (sigma_m + sigma_p);
-        auto gp = rp * sigma_p * nu * Ap;
-        auto gm = rm * sigma_m * nu * Am;
+        auto sm = sigma[i - 1];
+        auto sp = sigma[i + 0];
+        auto gm = g[i - 1];
+        auto gp = g[i + 0];
         auto tau = 0.0; // external torque / length
-        auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (sigma * r * lp);
-        auto s_hat = (v_hat > 0.0) * sigma_m + (v_hat < 0.0) * sigma_p;
-        return 2.0 * pi * r * v_hat * s_hat;
+        auto s_hat = 0.5 * (sm + sp);
+        auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (s_hat * r * lp);
+        return 2.0 * pi * r * s_hat * v_hat;
     }).cache();
-
     auto delta_dm = ic[interior_cells].map([fhat] HD (int i)
     {
         auto fm = fhat[i];
         auto fp = fhat[i + 1];
         return fm - fp;
     }) * dt;
+    return cache(dm.at(interior_cells) + delta_dm);
+}
+
+static void update_state(State& state, const Config& config)
+{
+    auto nu = config.viscosity;
+    auto dr = cell_lengths(config);
+    auto dt = 0.1 * (dr * dr / nu)[0];
 
     state = State{
         state.time + dt,
         state.iter + 1.0,
-        (dm.at(interior_cells) + delta_dm).cache(),
+        next_sigma(state, config, dt),
     };
 }
 
@@ -241,7 +246,7 @@ static void update_state(State& state, const Config& config)
 /**
  * 
  */
-class Blast : public Simulation<Config, State, Product>
+class Pringle : public Simulation<Config, State, Product>
 {
 public:
     const char* name() const override
@@ -363,7 +368,7 @@ public:
 int main(int argc, const char **argv)
 {
     try {
-        return Blast().run(argc, argv);
+        return Pringle().run(argc, argv);
     }
     catch (const std::exception& e) {
         vapor::print("[error] ");
