@@ -168,11 +168,14 @@ static auto cell_surface_areas(const Config& config)
 static auto mass_source_term(const d_array_t& dm, const Config& config)
 {
     auto rc = cell_coordinates(config);
-    return range(dm.size()).map([dm, rc] (int i) {
+    auto nu = config.viscosity;
+    auto rs = config.domain[2] * 10.0; // softening is set to 10x dr
+    auto f0 = 100.0; // the sink rate is 100x viscous
+    return range(dm.size()).map([dm, rc, nu, rs, f0] (int i) {
         auto a = 1.0;
         auto r = rc[i];
-        auto omega = keplerian_omega(max2(r, 0.05));
-        return -0.1 * dm[i] * omega * exp(-pow(r / a, 6.0));
+        auto visc_rate = 1.5 * nu / (r * r + rs * rs);
+        return -dm[i] * f0 * visc_rate * exp(-pow(r / a, 2.0));
     });
 }
 
@@ -195,7 +198,7 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
             return -1.0;
         }
         if (i == 0) {
-            return 0.0;
+            return  0.0;
         }
         auto r = rf[i];
         auto pi = M_PI;
@@ -313,12 +316,12 @@ public:
         auto initial_sigma = [*this] (double r)
         {
             auto Mdot = -1.0;
-            auto Jdot =  0.0;
+            auto Jdot = -1.0;
             auto pi = M_PI;
             auto nu = config.viscosity;
             auto j = specific_angular_momentum(r);
             auto sigma = (Jdot - Mdot * j) / (3 * pi * nu * j);
-            return sigma;
+            return max2(sigma, 0.1);
         };
         auto da = cell_surface_areas(config);
         auto sigma = cell_coordinates(config).map(initial_sigma);
