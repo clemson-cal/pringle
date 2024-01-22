@@ -57,14 +57,14 @@ struct Config
     double cpi = 1.0;
     double spi = 1.0;
     double tsi = 0.1;
-    double tol = 1e-8;
+    double tol = 1e-6; // used for the secant method in the implicit scheme
     double cfl = 0.1;
-    vec_t<double, 3> domain = {0.0, 10.0, 0.01};
+    vec_t<double, 3> domain = {0.0, 10.0, 0.01}; // inner, outer, step
     vec_t<double, 2> trange = {0.0, 0.0};
     std::vector<uint> sp = {0, 1};
     std::vector<uint> ts;
     std::string outdir = ".";
-    std::string method = "implicit";
+    std::string method = "explicit";
 };
 VISITABLE_STRUCT(Config, fold, rk, viscosity, cpi, spi, tsi, tol, cfl, domain, trange, sp, ts, outdir, method);
 
@@ -172,15 +172,20 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
     auto da = cell_surface_areas(config);
     auto iv = range(rc.size() + 1);
     auto ic = range(rc.size());
-    auto interior_faces = iv.space().contract(1);
-    auto interior_cells = ic.space().contract(1);
     auto nu = config.viscosity;
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
-    auto g = ic.map([rc, sigma, A, nu] (int i) { return rc[i] * sigma[i] * nu * A[i]; }).cache();
-    auto fhat = iv[interior_faces].map([sigma, g, rf, rc] (int i)
+    auto g = ic.map([rc, sigma, A, nu] (int i) {
+        return rc[i] * sigma[i] * nu * A[i];
+    }).cache();
+    auto fhat = iv.map([sigma, g, rf, rc] (int i)
     {
-        // v = (d/dR(R g) + tau) / (sigma R l')
+        if (i == rc.size()) {
+            return -1.0;
+        }
+        if (i == 0) {
+            return -1.0;
+        }
         auto r = rf[i];
         auto pi = M_PI;
         auto lp = specific_angular_momentum_derivative(r);
@@ -193,17 +198,18 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
         auto tau = 0.0; // external torque / length (zero, for now)
         auto s_hat = 0.5 * (sm + sp);
         auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (s_hat * r * lp);
+        // v = (d/dR(R g) + tau) / (sigma R l')
         if (s_hat < 0.0) {
             throw std::runtime_error(format("found negative sigma at position %f", r));
         }
         return 2.0 * pi * r * s_hat * v_hat;
     }).cache();
-    return zeros<double>(ic.space()).insert(ic[interior_cells].map([fhat] (int i)
+    return ic.map([fhat] (int i)
     {
         auto fm = fhat[i];
         auto fp = fhat[i + 1];
         return fm - fp;
-    }));
+    });
 }
 
 static auto next_dm(const d_array_t& dm, const Config& config, double dt)
