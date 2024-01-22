@@ -54,7 +54,7 @@ struct Config
     int fold = 1;
     int rk = 1;
     double viscosity = 0.001;
-    double cpi = 1.0;
+    double cpi = 0.0;
     double spi = 1.0;
     double tsi = 0.1;
     double tol = 1e-6; // used for the secant method in the implicit scheme
@@ -165,6 +165,17 @@ static auto cell_surface_areas(const Config& config)
     return da;
 }
 
+static auto mass_source_term(const d_array_t& dm, const Config& config)
+{
+    auto rc = cell_coordinates(config);
+    return range(dm.size()).map([dm, rc] (int i) {
+        auto a = 1.0;
+        auto r = rc[i];
+        auto omega = keplerian_omega(max2(r, 0.05));
+        return -0.1 * dm[i] * omega * exp(-pow(r / a, 6.0));
+    });
+}
+
 static auto dm_dot(const d_array_t& dm, const Config& config)
 {
     auto rf = face_coordinates(config);
@@ -184,7 +195,7 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
             return -1.0;
         }
         if (i == 0) {
-            return -1.0;
+            return 0.0;
         }
         auto r = rf[i];
         auto pi = M_PI;
@@ -209,13 +220,12 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
         auto fm = fhat[i];
         auto fp = fhat[i + 1];
         return fm - fp;
-    });
+    }) + mass_source_term(dm, config);
 }
 
 static auto next_dm(const d_array_t& dm, const Config& config, double dt)
 {
-    auto l = dm_dot(dm, config);
-    return cache(dm + l * dt);
+    return cache(dm + (dm_dot(dm, config)) * dt);
 }
 
 static auto next_dm_implicit(const d_array_t& x0, const Config& config, double dt)
@@ -303,7 +313,7 @@ public:
         auto initial_sigma = [*this] (double r)
         {
             auto Mdot = -1.0;
-            auto Jdot = -1.0;
+            auto Jdot =  0.0;
             auto pi = M_PI;
             auto nu = config.viscosity;
             auto j = specific_angular_momentum(r);
