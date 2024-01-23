@@ -52,7 +52,10 @@ using Product = d_array_t;
 struct Config
 {
     int fold = 1;
-    int rk = 1;
+    double mdot_outer = -1.0;
+    double mdot_inner = -1.0;
+    double jdot_outer = -1.0;
+    double sink_rate = 0.0;
     double viscosity = 0.001;
     double cpi = 0.0;
     double spi = 1.0;
@@ -66,7 +69,25 @@ struct Config
     std::string outdir = ".";
     std::string method = "explicit";
 };
-VISITABLE_STRUCT(Config, fold, rk, viscosity, cpi, spi, tsi, tol, cfl, domain, trange, sp, ts, outdir, method);
+VISITABLE_STRUCT(Config,
+    fold,
+    mdot_outer,
+    mdot_inner,
+    jdot_outer,
+    sink_rate,
+    viscosity,
+    cpi,
+    spi,
+    tsi,
+    tol,
+    cfl,
+    domain,
+    trange,
+    sp,
+    ts,
+    outdir,
+    method
+);
 
 
 
@@ -169,13 +190,33 @@ static auto mass_source_term(const d_array_t& dm, const Config& config)
 {
     auto rc = cell_coordinates(config);
     auto nu = config.viscosity;
-    auto rs = config.domain[2] * 10.0; // softening is set to 10x dr
-    auto f0 = 100.0; // the sink rate is 100x viscous
-    return range(dm.size()).map([dm, rc, nu, rs, f0] (int i) {
-        auto a = 1.0;
-        auto r = rc[i];
-        auto visc_rate = 1.5 * nu / (r * r + rs * rs);
-        return -dm[i] * f0 * visc_rate * exp(-pow(r / a, 2.0));
+    auto rs = config.domain[2] * 0.0; // softening is set to some fraction of dr
+    auto f0 = config.sink_rate; // sink rate, relative to local viscous rate
+    if (f0 != 0.0) {
+        return range(dm.space()).map([=] (int i) {
+            auto a = 1.0;
+            auto r = rc[i];
+            auto visc_rate = 1.5 * nu / (r * r + rs * rs);
+            return -dm[i] * f0 * visc_rate * exp(-pow(r / a, 2.0));
+        }).cache();
+    }
+    else {
+        return zeros<double>(dm.space()).cache();
+    }
+}
+
+static auto external_torque_per_unit_length(const d_array_t& dm, const Config& config)
+{
+    auto rf = face_coordinates(config);
+    auto dr = cell_lengths(config);
+    return range(rf.space().contract(1)).map([=] (int i) {
+        auto a = 2.5;
+        auto r = rf[i];
+        auto dm_dr = 1.0; // (dm[i] + dm[i - 1]) / (dr[i] + dr[i - 1]);
+        auto dj_dr = dm_dr * specific_angular_momentum(r);
+        auto f = 1.0 * pow(r / a, 6.0) * exp(-pow(r / a, 6.0));
+        auto omega = keplerian_omega(a);
+        return dj_dr * omega * f;
     });
 }
 
@@ -184,21 +225,24 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
     auto rf = face_coordinates(config);
     auto rc = cell_coordinates(config);
     auto da = cell_surface_areas(config);
-    auto iv = range(rc.size() + 1);
-    auto ic = range(rc.size());
+    auto iv = range(rf.space());
+    auto ic = range(rc.space());
     auto nu = config.viscosity;
+    auto tau = external_torque_per_unit_length(dm, config);
+    auto mdot_outer = config.mdot_outer;
+    auto mdot_inner = config.mdot_inner;
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
     auto g = ic.map([rc, sigma, A, nu] (int i) {
         return rc[i] * sigma[i] * nu * A[i];
     }).cache();
-    auto fhat = iv.map([sigma, g, rf, rc] (int i)
+    auto fhat = iv.map([=] (int i)
     {
         if (i == rc.size()) {
-            return -1.0;
+            return mdot_outer;
         }
         if (i == 0) {
-            return  0.0;
+            return mdot_inner;
         }
         auto r = rf[i];
         auto pi = M_PI;
@@ -209,12 +253,15 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
         auto sp = sigma[i + 0];
         auto gm = g[i - 1];
         auto gp = g[i + 0];
-        auto tau = 0.0; // external torque / length (zero, for now)
+        auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau[i]) / (0.5 * (sm + sp) * r * lp);
         auto s_hat = 0.5 * (sm + sp);
-        auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau) / (s_hat * r * lp);
+        if (v_hat > 0.0) {        
+            // throw std::runtime_error(format("found positive v_hat %f at position %f", v_hat, r));
+        }
+        // auto s_hat = (v_hat < 0.0) * sp + (v_hat > 0.0) * sm;
         // v = (d/dR(R g) + tau) / (sigma R l')
         if (s_hat < 0.0) {
-            throw std::runtime_error(format("found negative sigma at position %f", r));
+            // throw std::runtime_error(format("found negative sigma %f at position %f", s_hat, r));
         }
         return 2.0 * pi * r * s_hat * v_hat;
     }).cache();
@@ -315,8 +362,8 @@ public:
     {
         auto initial_sigma = [*this] (double r)
         {
-            auto Mdot = -1.0;
-            auto Jdot = -1.0;
+            auto Mdot = config.mdot_outer;
+            auto Jdot = config.jdot_outer;
             auto pi = M_PI;
             auto nu = config.viscosity;
             auto j = specific_angular_momentum(r);
@@ -363,16 +410,16 @@ public:
     const char* get_product_name(uint column) const override
     {
         switch (column) {
-        case 0: return "sigma";
-        case 1: return "radius";
+        case 0: return "radius";
+        case 1: return "sigma";
         }
         return nullptr;
     }
     Product compute_product(const State& state, uint column) const override
     {
         switch (column) {
-        case 0: return cache(state.mass / cell_surface_areas(config));
-        case 1: return cache(cell_coordinates(config));
+        case 0: return cache(cell_coordinates(config));
+        case 1: return cache(state.mass / cell_surface_areas(config));
         }
         return {};
     }
