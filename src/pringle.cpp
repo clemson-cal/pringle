@@ -350,6 +350,10 @@ public:
     {
         return config.outdir.data();
     }
+    bool use_persistent_session() const override
+    {
+        return true;
+    }
     double get_time(const State& state) const override
     {
         return state.time;
@@ -411,7 +415,8 @@ public:
     {
         switch (column) {
         case 0: return "radius";
-        case 1: return "sigma";
+        case 1: return "mdot";
+        case 2: return "sigma";
         }
         return nullptr;
     }
@@ -419,7 +424,8 @@ public:
     {
         switch (column) {
         case 0: return cache(cell_coordinates(config));
-        case 1: return cache(state.mass / cell_surface_areas(config));
+        case 1: return cache(mass_source_term(state.mass, config));
+        case 2: return cache(state.mass / cell_surface_areas(config));
         }
         return {};
     }
@@ -431,12 +437,17 @@ public:
     {
         switch (column) {
         case 0: return "time";
+        case 1: return "mdot";
         }
         return nullptr;
     }
     double compute_timeseries_sample(const State& state, uint column) const override
     {
-        return state.time;
+        switch (column) {
+        case 0: return state.time;
+        case 1: return sum(mass_source_term(state.mass, config));
+        }
+        return 0.0;
     }
     vec_t<char, 256> status_message(const State& state, double secs_per_update) const override
     {
