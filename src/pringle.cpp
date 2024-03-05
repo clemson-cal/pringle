@@ -196,8 +196,7 @@ static auto mass_source_term(const d_array_t& dm, const Config& config)
         return range(dm.space()).map([=] (int i) {
             auto a = 1.0;
             auto r = rc[i];
-            auto visc_rate = 1.5 * nu / (r * r + rs * rs);
-            return -dm[i] * f0 * visc_rate * exp(-pow(r / a, 2.0));
+            return -dm[i] * f0 * exp(-pow(r / a, 8.0));
         }).cache();
     }
     else {
@@ -210,13 +209,14 @@ static auto external_torque_per_unit_length(const d_array_t& dm, const Config& c
     auto rf = face_coordinates(config);
     auto dr = cell_lengths(config);
     return range(rf.space().contract(1)).map([=] (int i) {
-        auto a = 2.5;
-        auto r = rf[i];
-        auto dm_dr = 1.0; // (dm[i] + dm[i - 1]) / (dr[i] + dr[i - 1]);
-        auto dj_dr = dm_dr * specific_angular_momentum(r);
-        auto f = 1.0 * pow(r / a, 6.0) * exp(-pow(r / a, 6.0));
-        auto omega = keplerian_omega(a);
-        return dj_dr * omega * f;
+        return 0.0;
+        // auto a = 2.5;
+        // auto r = rf[i];
+        // auto dm_dr = 1.0; // (dm[i] + dm[i - 1]) / (dr[i] + dr[i - 1]);
+        // auto dj_dr = dm_dr * specific_angular_momentum(r);
+        // auto f = 1.0 * pow(r / a, 6.0) * exp(-pow(r / a, 6.0));
+        // auto omega = keplerian_omega(a);
+        // return dj_dr * omega * f;
     });
 }
 
