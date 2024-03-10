@@ -24,7 +24,7 @@ SOFTWARE.
 
 #include <cmath>
 #include "vapor/vapor.hpp"
-#include <iostream>
+
 
 
 
@@ -44,9 +44,7 @@ using Product = d_array_t;
 #define GM 1.0
 
 
-double time_global;
-double binary_radii_sink;
-double binary_accretion_sum_global;
+
 
 /**
  * User configuration
@@ -54,7 +52,7 @@ double binary_accretion_sum_global;
 struct Config
 {
     double torque_coefficient = 1;
-    double time_to_merger = 10000;
+    double inspiral_rate = 0.0;
     int fold = 1;
     double mdot_outer = -1.0;
     double mdot_inner = -1.0;
@@ -75,7 +73,7 @@ struct Config
 };
 VISITABLE_STRUCT(Config,
     torque_coefficient,
-    time_to_merger,
+    inspiral_rate,
     fold,
     mdot_outer,
     mdot_inner,
@@ -192,33 +190,23 @@ static auto cell_surface_areas(const Config& config)
     return da;
 }
 
-static auto mass_source_term(const d_array_t& dm, const Config& config)
+static auto binary_separation(double time, const Config& config)
+{
+    auto rs = 0.1; // minimum binary separation (hard-coded for now)
+    auto a = max2(rs, pow(max2(0.0, 1.0 - time * config.inspiral_rate), 0.25));
+    return a;
+}
+
+static auto mass_source_term(const d_array_t& dm, double time, const Config& config)
 {
     auto rc = cell_coordinates(config);
     auto nu = config.viscosity;
-    auto rs = config.domain[2] * 0.0; // softening is set to some fraction of dr
     auto f0 = config.sink_rate; // sink rate, relative to local viscous rate
-
-    
-    auto time_to_merger = config.time_to_merger;
-    auto time = time_global;
-    auto source_term_edge = 1 - time/time_to_merger;
-    //source_term_edge = 0;
-    
-    if (source_term_edge < .00001){
-        source_term_edge = .00001;
-    }
-    
-    auto radius = 1 * pow(source_term_edge, .25);
-    //std::cout << "Source Term Edge: " << source_term_edge;
-    //std::cout << "Radius:" << radius << "\t";
-    binary_radii_sink = radius;
-    
+    auto a = binary_separation(time, config);
+    auto f = f0 * 1.5 * nu / a / a;
     if (f0 != 0.0) {
         return range(dm.space()).map([=] (int i) {
-            auto a = 1.0;
-            auto r = rc[i];
-            return -dm[i] * f0 * exp(-pow((r) / (a * radius), 8.0));
+            return -dm[i] * f * exp(-pow(rc[i] / a, 4.0));
         }).cache();
     }
     else {
@@ -226,32 +214,35 @@ static auto mass_source_term(const d_array_t& dm, const Config& config)
     }
 }
 
-static auto external_torque_per_unit_length(const d_array_t& dm, const Config& config)
+static auto external_torque_per_unit_length(const d_array_t& dm, double time, const Config& config)
 {
     auto rf = face_coordinates(config);
-    auto dr = cell_lengths(config);
-    return range(rf.space().contract(1)).map([=] (int i) {
-        //return 0.0;
-        auto a = 2.5;
-        auto r = rf[i];
-        auto dm_dr = 1.0; // (dm[i] + dm[i - 1]) / (dr[i] + dr[i - 1]);
-        auto dj_dr = dm_dr * specific_angular_momentum(r);
-        auto torque0 = config.torque_coefficient;
-        auto specific_angular_momentum_coefficient = 1 * specific_angular_momentum(binary_radii_sink) * binary_accretion_sum_global;
-        if (specific_angular_momentum_coefficient > 20.0){
-            specific_angular_momentum_coefficient = 20.0;
-        }
-
-        //std::cout << "Coefficient: " << specific_angular_momentum_coefficient;
-        //std::cout << "Binary Radii:  " << binary_radii_sink;
-
-        auto f = torque0 * pow(r / a, 6.0) * exp(-pow(r / a, 6.0));
-        auto omega = keplerian_omega(a);
-        return dj_dr * omega * f * specific_angular_momentum_coefficient;
-    });
+    auto nominal_total_mdot = 1.0; // this should probably be set to the current actual Mdot
+    if (config.torque_coefficient != 0.0) {
+        auto a = binary_separation(time, config);
+        return range(rf.space().contract(1)).map([=] (int i) {
+            // This prescription is a work-in-progress and will probably
+            // change
+            auto r = rf[i];
+            auto ell = specific_angular_momentum(r);
+            auto torque0 = config.torque_coefficient;
+            auto specific_angular_momentum_coefficient = 1 * specific_angular_momentum(a) * nominal_total_mdot;
+            if (specific_angular_momentum_coefficient > 20.0) {
+                specific_angular_momentum_coefficient = 20.0;
+            }
+            // print("Coefficient: ", specific_angular_momentum_coefficient, "\n");
+            // print("Binary Radii:  ", binary_radii_sink, "\n");
+            auto f = torque0 * pow(r / a, 6.0) * exp(-pow(r / a, 6.0));
+            auto omega = keplerian_omega(a);
+            return ell * omega * f * specific_angular_momentum_coefficient;
+        }).cache();
+    }
+    else {
+        return zeros<double>(rf.space().contract(1)).cache();
+    }
 }
 
-static auto dm_dot(const d_array_t& dm, const Config& config)
+static auto dm_dot(const d_array_t& dm, double time, const Config& config)
 {
     auto rf = face_coordinates(config);
     auto rc = cell_coordinates(config);
@@ -259,7 +250,7 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
     auto iv = range(rf.space());
     auto ic = range(rc.space());
     auto nu = config.viscosity;
-    auto tau = external_torque_per_unit_length(dm, config);
+    auto tau = external_torque_per_unit_length(dm, time, config);
     auto mdot_outer = config.mdot_outer;
     auto mdot_inner = config.mdot_inner;
     auto sigma = cache(dm / da);
@@ -292,7 +283,7 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
         // auto s_hat = (v_hat < 0.0) * sp + (v_hat > 0.0) * sm;
         // v = (d/dR(R g) + tau) / (sigma R l')
         if (s_hat < 0.0) {
-            //throw std::runtime_error(format("found negative sigma %f at position %f", s_hat, r));
+            throw std::runtime_error(format("found negative sigma %f at position %f", s_hat, r));
         }
         return 2.0 * pi * r * s_hat * v_hat;
     }).cache();
@@ -301,22 +292,22 @@ static auto dm_dot(const d_array_t& dm, const Config& config)
         auto fm = fhat[i];
         auto fp = fhat[i + 1];
         return fm - fp;
-    }) + mass_source_term(dm, config);
+    }) + mass_source_term(dm, time, config);
 }
 
-static auto next_dm(const d_array_t& dm, const Config& config, double dt)
+static auto next_dm(const d_array_t& dm, double time, const Config& config, double dt)
 {
-    return cache(dm + (dm_dot(dm, config)) * dt);
+    return cache(dm + (dm_dot(dm, time, config)) * dt);
 }
 
-static auto next_dm_implicit(const d_array_t& x0, const Config& config, double dt)
+static auto next_dm_implicit(const d_array_t& x0, double time, const Config& config, double dt)
 {
-    auto f = [x0, &config, dt] (auto x) {
-        return x - x0 - dm_dot(x, config) * dt;
+    auto f = [x0, time, &config, dt] (auto x) {
+        return x - x0 - dm_dot(x, time, config) * dt;
     };
     auto eps = 1e-12;
     auto tol = config.tol;
-    auto x1 = next_dm(x0, config, dt);
+    auto x1 = next_dm(x0, time, config, dt);
     auto x2 = cache(x1 - f(x1) * (x1 - x0) / (f(x1) - f(x0) + eps));
     auto iter = 0;
     while (max(f(x2)) > tol) {
@@ -336,25 +327,19 @@ static void update_state(State& state, const Config& config, double& timestep)
     auto nu = config.viscosity;    
     auto dr = cell_lengths(config);
     auto dt = timestep = config.cfl * (dr * dr / nu)[0];
-    time_global = state.time;
-    //std::cout << time_global;
-    binary_accretion_sum_global = -sum(mass_source_term(state.mass, config));
-    std::cout << "Radius:" << binary_radii_sink << "\t";
-    std::cout << "Mdot: " << binary_accretion_sum_global << "\t";
-
 
     if (config.method == "implicit") {
         state = State{
             state.time + dt,
             state.iter + 1.0,
-            next_dm_implicit(state.mass, config, dt),
+            next_dm_implicit(state.mass, state.time, config, dt),
         };
     }
     else if (config.method == "explicit") {
         state = State{
             state.time + dt,
             state.iter + 1.0,
-            next_dm(state.mass, config, dt),
+            next_dm(state.mass, state.time, config, dt),
         };
     }
     else {
@@ -461,7 +446,7 @@ public:
     {
         switch (column) {
         case 0: return cache(cell_coordinates(config));
-        case 1: return cache(mass_source_term(state.mass, config));
+        case 1: return cache(mass_source_term(state.mass, state.time, config));
         case 2: return cache(state.mass / cell_surface_areas(config));
         }
         return {};
@@ -482,7 +467,7 @@ public:
     {
         switch (column) {
         case 0: return state.time;
-        case 1: return -sum(mass_source_term(state.mass, config));
+        case 1: return -sum(mass_source_term(state.mass, state.time, config));
         }
         return 0.0;
     }
