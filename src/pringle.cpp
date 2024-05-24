@@ -48,6 +48,12 @@ using Product = d_array_t;
 
 /**
  * User configuration
+ *
+ * Note: the code should be re-configured to use units in which t_dec=1 and r_dec=1.
+ * It should also be changed so the inspiral rate parameter is removed. Running the
+ * code to t=10^4 should mean you ran for 10^4 decoupling times.
+ *
+ * It should also be changed so that time starts positive, and decreases toward 0.0.
  */
 struct Config
 {
@@ -204,9 +210,11 @@ static auto mass_source_term(const d_array_t& dm, double time, const Config& con
     auto f0 = config.sink_rate; // sink rate, relative to local viscous rate
     auto a = binary_separation(time, config);
     auto f = f0 * 1.5 * nu / a / a;
+    // This piece of code can be generalized to handle different jdot_inner's,
+    // (or ell's) by changing the sink radius to different fractions of a.
     if (f0 != 0.0) {
         return range(dm.space()).map([=] (int i) {
-            return -dm[i] * f * exp(-pow(rc[i] / a, 4.0));
+            return -dm[i] * f * exp(-pow(rc[i] / a, 16.0));
         }).cache();
     }
     else {
@@ -214,33 +222,33 @@ static auto mass_source_term(const d_array_t& dm, double time, const Config& con
     }
 }
 
-static auto external_torque_per_unit_length(const d_array_t& dm, double time, const Config& config)
-{
-    auto rf = face_coordinates(config);
-    auto nominal_total_mdot = 1.0; // this should probably be set to the current actual Mdot
-    if (config.torque_coefficient != 0.0) {
-        auto a = binary_separation(time, config);
-        return range(rf.space().contract(1)).map([=] (int i) {
-            // This prescription is a work-in-progress and will probably
-            // change
-            auto r = rf[i];
-            auto ell = specific_angular_momentum(r);
-            auto torque0 = config.torque_coefficient;
-            auto specific_angular_momentum_coefficient = 1 * specific_angular_momentum(a) * nominal_total_mdot;
-            if (specific_angular_momentum_coefficient > 20.0) {
-                specific_angular_momentum_coefficient = 20.0;
-            }
-            // print("Coefficient: ", specific_angular_momentum_coefficient, "\n");
-            // print("Binary Radii:  ", binary_radii_sink, "\n");
-            auto f = torque0 * pow(r / a, 6.0) * exp(-pow(r / a, 6.0));
-            auto omega = keplerian_omega(a);
-            return ell * omega * f * specific_angular_momentum_coefficient;
-        }).cache();
-    }
-    else {
-        return zeros<double>(rf.space().contract(1)).cache();
-    }
-}
+// static auto external_torque_per_unit_length(const d_array_t& dm, double time, const Config& config)
+// {
+//     auto rf = face_coordinates(config);
+//     auto nominal_total_mdot = 1.0; // this should probably be set to the current actual Mdot
+//     if (config.torque_coefficient != 0.0) {
+//         auto a = binary_separation(time, config);
+//         return range(rf.space().contract(1)).map([=] (int i) {
+//             // This prescription is a work-in-progress and will probably
+//             // change
+//             auto r = rf[i];
+//             auto ell = specific_angular_momentum(r);
+//             auto torque0 = config.torque_coefficient;
+//             auto specific_angular_momentum_coefficient = 1 * specific_angular_momentum(a) * nominal_total_mdot;
+//             if (specific_angular_momentum_coefficient > 20.0) {
+//                 specific_angular_momentum_coefficient = 20.0;
+//             }
+//             // print("Coefficient: ", specific_angular_momentum_coefficient, "\n");
+//             // print("Binary Radii:  ", binary_radii_sink, "\n");
+//             auto f = torque0 * pow(r / a, 6.0) * exp(-pow(r / a, 6.0));
+//             auto omega = keplerian_omega(a);
+//             return ell * omega * f * specific_angular_momentum_coefficient;
+//         }).cache();
+//     }
+//     else {
+//         return zeros<double>(rf.space().contract(1)).cache();
+//     }
+// }
 
 static auto dm_dot(const d_array_t& dm, double time, const Config& config)
 {
@@ -250,7 +258,7 @@ static auto dm_dot(const d_array_t& dm, double time, const Config& config)
     auto iv = range(rf.space());
     auto ic = range(rc.space());
     auto nu = config.viscosity;
-    auto tau = external_torque_per_unit_length(dm, time, config);
+    // auto tau = external_torque_per_unit_length(dm, time, config);
     auto mdot_outer = config.mdot_outer;
     auto mdot_inner = config.mdot_inner;
     auto sigma = cache(dm / da);
@@ -275,7 +283,8 @@ static auto dm_dot(const d_array_t& dm, double time, const Config& config)
         auto sp = sigma[i + 0];
         auto gm = g[i - 1];
         auto gp = g[i + 0];
-        auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau[i]) / (0.5 * (sm + sp) * r * lp);
+        // auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau[i]) / (0.5 * (sm + sp) * r * lp);
+        auto v_hat = ((rp * gp - rm * gm) / (rp - rm)) / (0.5 * (sm + sp) * r * lp);
         auto s_hat = 0.5 * (sm + sp);
         if (v_hat > 0.0) {        
             // throw std::runtime_error(format("found positive v_hat %f at position %f", v_hat, r));
@@ -394,7 +403,7 @@ public:
             auto nu = config.viscosity;
             auto j = specific_angular_momentum(r);
             auto sigma = (Jdot - Mdot * j) / (3 * pi * nu * j);
-            return max2(sigma, 0.1);
+            return max2(sigma, 1e-9);
         };
         auto da = cell_surface_areas(config);
         auto sigma = cell_coordinates(config).map(initial_sigma);
