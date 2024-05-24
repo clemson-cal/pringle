@@ -57,29 +57,26 @@ using Product = d_array_t;
  */
 struct Config
 {
-    double torque_coefficient = 1;
-    double inspiral_rate = 0.0;
     int fold = 1;
     double mdot_outer = -1.0;
-    double mdot_inner = -1.0;
+    double mdot_inner =  0.0;
     double jdot_outer = -1.0;
-    double sink_rate = 0.0;
+    double sink_rate = 1e3;
     double viscosity = 0.001;
     double cpi = 0.0;
     double spi = 1.0;
     double tsi = 0.1;
     double tol = 1e-6; // used for the secant method in the implicit scheme
     double cfl = 0.1;
+    double tstart = 10.0;
+    double tfinal = 1.0;
     vec_t<double, 3> domain = {0.0, 10.0, 0.01}; // inner, outer, step
-    vec_t<double, 2> trange = {0.0, 0.0};
     std::vector<uint> sp = {0, 1};
     std::vector<uint> ts;
     std::string outdir = ".";
     std::string method = "explicit";
 };
 VISITABLE_STRUCT(Config,
-    torque_coefficient,
-    inspiral_rate,
     fold,
     mdot_outer,
     mdot_inner,
@@ -91,8 +88,9 @@ VISITABLE_STRUCT(Config,
     tsi,
     tol,
     cfl,
+    tstart,
+    tfinal,
     domain,
-    trange,
     sp,
     ts,
     outdir,
@@ -196,11 +194,9 @@ static auto cell_surface_areas(const Config& config)
     return da;
 }
 
-static auto binary_separation(double time, const Config& config)
+static auto binary_separation(double time)
 {
-    auto rs = 0.1; // minimum binary separation (hard-coded for now)
-    auto a = max2(rs, pow(max2(0.0, 1.0 - time * config.inspiral_rate), 0.25));
-    return a;
+    return pow(time, 0.25);
 }
 
 static auto mass_source_term(const d_array_t& dm, double time, const Config& config)
@@ -208,13 +204,11 @@ static auto mass_source_term(const d_array_t& dm, double time, const Config& con
     auto rc = cell_coordinates(config);
     auto nu = config.viscosity;
     auto f0 = config.sink_rate; // sink rate, relative to local viscous rate
-    auto a = binary_separation(time, config);
+    auto a = binary_separation(time);
     auto f = f0 * 1.5 * nu / a / a;
-    // This piece of code can be generalized to handle different jdot_inner's,
-    // (or ell's) by changing the sink radius to different fractions of a.
     if (f0 != 0.0) {
         return range(dm.space()).map([=] (int i) {
-            return -dm[i] * f * (rc[i] < a); // exp(-pow(rc[i] / a, 16.0));
+            return -dm[i] * f * exp(-pow(rc[i] / a, 16.0));
         }).cache();
     }
     else {
@@ -339,14 +333,14 @@ static void update_state(State& state, const Config& config, double& timestep)
 
     if (config.method == "implicit") {
         state = State{
-            state.time + dt,
+            state.time - dt,
             state.iter + 1.0,
             next_dm_implicit(state.mass, state.time, config, dt),
         };
     }
     else if (config.method == "explicit") {
         state = State{
-            state.time + dt,
+            state.time - dt,
             state.iter + 1.0,
             next_dm(state.mass, state.time, config, dt),
         };
@@ -387,7 +381,7 @@ public:
     }
     double get_time(const State& state) const override
     {
-        return state.time;
+        return config.tstart - state.time;
     }
     uint get_iteration(const State& state) const override
     {
@@ -397,17 +391,17 @@ public:
     {
         auto initial_sigma = [*this] (double r)
         {
+            auto j = specific_angular_momentum(r);
             auto Mdot = config.mdot_outer;
-            auto Jdot = config.jdot_outer;
+            auto Jdot = Mdot * specific_angular_momentum(binary_separation(config.tstart));
             auto pi = M_PI;
             auto nu = config.viscosity;
-            auto j = specific_angular_momentum(r);
             auto sigma = (Jdot - Mdot * j) / (3 * pi * nu * j);
             return max2(sigma, 1e-9);
         };
         auto da = cell_surface_areas(config);
         auto sigma = cell_coordinates(config).map(initial_sigma);
-        state.time = config.trange[0];
+        state.time = config.tstart;
         state.iter = 0.0;
         state.mass = cache(sigma * da);
         if (any(state.mass < 0.0)) {
@@ -420,7 +414,7 @@ public:
     }
     bool should_continue(const State& state) const override
     {
-        return state.time < config.trange[1];
+        return state.time > config.tfinal;
     }
     uint updates_per_batch() const override
     {
@@ -484,7 +478,7 @@ public:
     {
         return format("[%04d] t=%lf dt=%.6e Mzps=%.2lf",
             get_iteration(state),
-            get_time(state),
+            state.time,
             timestep,
             1e-6 * state.mass.size() / secs_per_update);
     }

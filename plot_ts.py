@@ -11,14 +11,10 @@ def main(filenames: list[Path]):
     ax1.axhline(1.0, lw=1.0, ls="--", c="pink", label="Mass inflow rate")
     for filename in filenames:
         h5f = File(filename)
-        ir = h5f["config"]["inspiral_rate"][...]
-        if ir > 0.0:
-            ax1.axvline(ir**-1, c="grey", ls="--", lw=1.0, label="Merger time")
         time = h5f["timeseries"]["time"][...]
         mdot = h5f["timeseries"]["mdot"][...]
-        ax1.plot(time, mdot - 0, label=filename)
-    ax1.set_ylim(0.0, 1.5)
-    ax1.set_xlabel("Time [Initial Binary Orbits]")
+        ax1.plot(time, mdot, label=filename)
+    # ax1.set_ylim(0.0, 1.5)
     ax1.set_ylabel(r"$\dot M$")
     ax1.legend()
     # plt.savefig("samuel.pdf")
