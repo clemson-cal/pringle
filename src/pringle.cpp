@@ -214,7 +214,7 @@ static auto mass_source_term(const d_array_t& dm, double time, const Config& con
     // (or ell's) by changing the sink radius to different fractions of a.
     if (f0 != 0.0) {
         return range(dm.space()).map([=] (int i) {
-            return -dm[i] * f * exp(-pow(rc[i] / a, 16.0));
+            return -dm[i] * f * (rc[i] < a); // exp(-pow(rc[i] / a, 16.0));
         }).cache();
     }
     else {
