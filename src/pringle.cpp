@@ -20,8 +20,23 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ================================================================================
-*/
 
+Notes:
+================================================================================
+Time counts down from tstart and the binary merges at t = 0.0
+
+The code has units in which t_dec = 1 and r_dec = 1
+
+If t_dec and r_dec are known, then cone can solve for nu:
+
+The code uses constant-nu viscosity with nu = 1 / 6:
+    a = t^(1 / 4)
+    adot = a / (4 * t)
+    a / adot = tvisc(a)
+    4 * t = 2 a^2 / 3 nu; t = a = 1
+    nu = 1 / 6 * r_dec^2 / t_dec
+================================================================================
+*/
 #include <cmath>
 #include "vapor/vapor.hpp"
 
@@ -48,53 +63,37 @@ using Product = d_array_t;
 
 /**
  * User configuration
- *
- * Note: the code should be re-configured to use units in which t_dec=1 and r_dec=1.
- * It should also be changed so the inspiral rate parameter is removed. Running the
- * code to t=10^4 should mean you ran for 10^4 decoupling times.
- *
- * It should also be changed so that time starts positive, and decreases toward 0.0.
  */
 struct Config
 {
     int fold = 1;
-    double mdot_outer = -1.0;
-    double mdot_inner =  0.0;
-    double jdot_outer = -1.0;
     double sink_rate = 1e3;
-    double viscosity = 0.001;
+    double viscosity = 1.0 / 6.0;
     double cpi = 0.0;
     double spi = 1.0;
     double tsi = 0.1;
-    double tol = 1e-6; // used for the secant method in the implicit scheme
     double cfl = 0.1;
     double tstart = 10.0;
     double tfinal = 1.0;
     vec_t<double, 3> domain = {0.0, 10.0, 0.01}; // inner, outer, step
     std::vector<uint> sp = {0, 1};
-    std::vector<uint> ts;
+    std::vector<uint> ts = {0, 1, 2};
     std::string outdir = ".";
-    std::string method = "explicit";
 };
 VISITABLE_STRUCT(Config,
     fold,
-    mdot_outer,
-    mdot_inner,
-    jdot_outer,
     sink_rate,
     viscosity,
     cpi,
     spi,
     tsi,
-    tol,
     cfl,
     tstart,
     tfinal,
     domain,
     sp,
     ts,
-    outdir,
-    method
+    outdir
 );
 
 
@@ -216,34 +215,6 @@ static auto mass_source_term(const d_array_t& dm, double time, const Config& con
     }
 }
 
-// static auto external_torque_per_unit_length(const d_array_t& dm, double time, const Config& config)
-// {
-//     auto rf = face_coordinates(config);
-//     auto nominal_total_mdot = 1.0; // this should probably be set to the current actual Mdot
-//     if (config.torque_coefficient != 0.0) {
-//         auto a = binary_separation(time, config);
-//         return range(rf.space().contract(1)).map([=] (int i) {
-//             // This prescription is a work-in-progress and will probably
-//             // change
-//             auto r = rf[i];
-//             auto ell = specific_angular_momentum(r);
-//             auto torque0 = config.torque_coefficient;
-//             auto specific_angular_momentum_coefficient = 1 * specific_angular_momentum(a) * nominal_total_mdot;
-//             if (specific_angular_momentum_coefficient > 20.0) {
-//                 specific_angular_momentum_coefficient = 20.0;
-//             }
-//             // print("Coefficient: ", specific_angular_momentum_coefficient, "\n");
-//             // print("Binary Radii:  ", binary_radii_sink, "\n");
-//             auto f = torque0 * pow(r / a, 6.0) * exp(-pow(r / a, 6.0));
-//             auto omega = keplerian_omega(a);
-//             return ell * omega * f * specific_angular_momentum_coefficient;
-//         }).cache();
-//     }
-//     else {
-//         return zeros<double>(rf.space().contract(1)).cache();
-//     }
-// }
-
 static auto dm_dot(const d_array_t& dm, double time, const Config& config)
 {
     auto rf = face_coordinates(config);
@@ -252,9 +223,8 @@ static auto dm_dot(const d_array_t& dm, double time, const Config& config)
     auto iv = range(rf.space());
     auto ic = range(rc.space());
     auto nu = config.viscosity;
-    // auto tau = external_torque_per_unit_length(dm, time, config);
-    auto mdot_outer = config.mdot_outer;
-    auto mdot_inner = config.mdot_inner;
+    auto mdot_outer = -1.0;
+    auto mdot_inner =  0.0;
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
     auto g = ic.map([rc, sigma, A, nu] (int i) {
@@ -277,14 +247,8 @@ static auto dm_dot(const d_array_t& dm, double time, const Config& config)
         auto sp = sigma[i + 0];
         auto gm = g[i - 1];
         auto gp = g[i + 0];
-        // auto v_hat = ((rp * gp - rm * gm) / (rp - rm) + tau[i]) / (0.5 * (sm + sp) * r * lp);
         auto v_hat = ((rp * gp - rm * gm) / (rp - rm)) / (0.5 * (sm + sp) * r * lp);
         auto s_hat = 0.5 * (sm + sp);
-        if (v_hat > 0.0) {        
-            // throw std::runtime_error(format("found positive v_hat %f at position %f", v_hat, r));
-        }
-        // auto s_hat = (v_hat < 0.0) * sp + (v_hat > 0.0) * sm;
-        // v = (d/dR(R g) + tau) / (sigma R l')
         if (s_hat < 0.0) {
             throw std::runtime_error(format("found negative sigma %f at position %f", s_hat, r));
         }
@@ -331,23 +295,11 @@ static void update_state(State& state, const Config& config, double& timestep)
     auto dr = cell_lengths(config);
     auto dt = timestep = config.cfl * (dr * dr / nu)[0];
 
-    if (config.method == "implicit") {
-        state = State{
-            state.time - dt,
-            state.iter + 1.0,
-            next_dm_implicit(state.mass, state.time, config, dt),
-        };
-    }
-    else if (config.method == "explicit") {
-        state = State{
-            state.time - dt,
-            state.iter + 1.0,
-            next_dm(state.mass, state.time, config, dt),
-        };
-    }
-    else {
-        throw std::runtime_error("method must be implicit|explicit");
-    }
+    state = State{
+        state.time - dt,
+        state.iter + 1.0,
+        next_dm(state.mass, state.time, config, dt),
+    };
 }
 
 
@@ -391,13 +343,16 @@ public:
     {
         auto initial_sigma = [*this] (double r)
         {
-            auto j = specific_angular_momentum(r);
-            auto Mdot = config.mdot_outer;
-            auto Jdot = Mdot * specific_angular_momentum(binary_separation(config.tstart));
+            auto a = binary_separation(config.tstart);
+            auto ell = 1.0;
             auto pi = M_PI;
             auto nu = config.viscosity;
-            auto sigma = (Jdot - Mdot * j) / (3 * pi * nu * j);
-            return max2(sigma, 1e-9);
+            auto mdot = exp(-3. / 5. * ell / pow(a, 5. / 6.));
+            if (r > a) {
+                return mdot / (3 * pi * nu) * (1.0 - ell * sqrt(a / r));
+            } else {
+                return 1e-9;
+            }
         };
         auto da = cell_surface_areas(config);
         auto sigma = cell_coordinates(config).map(initial_sigma);
