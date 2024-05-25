@@ -205,14 +205,9 @@ static auto mass_source_term(const d_array_t& dm, double time, const Config& con
     auto f0 = config.sink_rate; // sink rate, relative to local viscous rate
     auto a = binary_separation(time);
     auto f = f0 * 1.5 * nu / a / a;
-    if (f0 != 0.0) {
-        return range(dm.space()).map([=] (int i) {
-            return -dm[i] * f * exp(-pow(rc[i] / a, 16.0));
-        }).cache();
-    }
-    else {
-        return zeros<double>(dm.space()).cache();
-    }
+    return range(dm.space()).map([=] (int i) {
+        return -dm[i] * f * exp(-pow(rc[i] / a, 16.0));
+    }).cache();
 }
 
 static auto dm_dot(const d_array_t& dm, double time, const Config& config)
