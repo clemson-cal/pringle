@@ -267,34 +267,11 @@ static auto next_dm(const d_array_t& dm, double time, const Config& config, doub
     return cache(dm + (dm_dot(dm, time, config)) * dt);
 }
 
-static auto next_dm_implicit(const d_array_t& x0, double time, const Config& config, double dt)
-{
-    auto f = [x0, time, &config, dt] (auto x) {
-        return x - x0 - dm_dot(x, time, config) * dt;
-    };
-    auto eps = 1e-12;
-    auto tol = config.tol;
-    auto x1 = next_dm(x0, time, config, dt);
-    auto x2 = cache(x1 - f(x1) * (x1 - x0) / (f(x1) - f(x0) + eps));
-    auto iter = 0;
-    while (max(f(x2)) > tol) {
-        auto x3 = cache(x2 - f(x2) * (x2 - x1) / (f(x2) - f(x1) + eps));
-        x1 = x2;
-        x2 = x3;
-        iter += 1;
-        if (iter > 100) {
-            throw std::runtime_error("implicit update is not converging, try a larger tol");
-        }
-    }
-    return x2;
-}
-
 static void update_state(State& state, const Config& config, double& timestep)
 {
     auto nu = config.viscosity;    
     auto dr = cell_lengths(config);
     auto dt = timestep = config.cfl * (dr * dr / nu)[0];
-
     state = State{
         state.time - dt,
         state.iter + 1.0,
