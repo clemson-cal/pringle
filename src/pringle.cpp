@@ -210,7 +210,14 @@ static auto mass_source_term(const d_array_t& dm, double time, const Config& con
     }).cache();
 }
 
-static auto dm_dot(const d_array_t& dm, double time, const Config& config)
+static auto mdot_supply(double time)
+{
+    auto ell = 1.0;
+    auto a = binary_separation(time);
+    return exp(-3. / 5. * ell / pow(a, 5. / 6.));
+}
+
+static auto mass_flux(const d_array_t& dm, double time, const Config& config)
 {
     auto rf = face_coordinates(config);
     auto rc = cell_coordinates(config);
@@ -218,14 +225,14 @@ static auto dm_dot(const d_array_t& dm, double time, const Config& config)
     auto iv = range(rf.space());
     auto ic = range(rc.space());
     auto nu = config.viscosity;
-    auto mdot_outer = -1.0;
+    auto mdot_outer = -mdot_supply(time);
     auto mdot_inner =  0.0;
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
     auto g = ic.map([rc, sigma, A, nu] (int i) {
         return rc[i] * sigma[i] * nu * A[i];
     }).cache();
-    auto fhat = iv.map([=] (int i)
+    return iv.map([=] (int i)
     {
         if (i == rc.size()) {
             return mdot_outer;
@@ -248,7 +255,14 @@ static auto dm_dot(const d_array_t& dm, double time, const Config& config)
             throw std::runtime_error(format("found negative sigma %f at position %f", s_hat, r));
         }
         return 2.0 * pi * r * s_hat * v_hat;
-    }).cache();
+    });
+}
+
+static auto dm_dot(const d_array_t& dm, double time, const Config& config)
+{
+    auto rc = cell_coordinates(config);
+    auto ic = range(rc.space());
+    auto fhat = mass_flux(dm, time, config).cache();
     return ic.map([fhat] (int i)
     {
         auto fm = fhat[i];
@@ -319,7 +333,7 @@ public:
             auto ell = 1.0;
             auto pi = M_PI;
             auto nu = config.viscosity;
-            auto mdot = exp(-3. / 5. * ell / pow(a, 5. / 6.));
+            auto mdot = mdot_supply(config.tstart);
             if (r > a) {
                 return mdot / (3 * pi * nu) * (1.0 - ell * sqrt(a / r));
             } else {
@@ -376,7 +390,7 @@ public:
     {
         switch (column) {
         case 0: return cache(cell_coordinates(config));
-        case 1: return cache(mass_source_term(state.mass, state.time, config));
+        case 1: return cache(mass_flux(state.mass, state.time, config) * -1.0);
         case 2: return cache(state.mass / cell_surface_areas(config));
         }
         return {};
