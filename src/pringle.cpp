@@ -76,8 +76,8 @@ struct Config
     double tstart = 10.0;
     double tfinal = 1.0;
     vec_t<double, 3> domain = {0.0, 10.0, 0.01}; // inner, outer, step
-    std::vector<uint> sp = {0, 1};
-    std::vector<uint> ts = {0, 1, 2};
+    std::vector<uint> sp = {0, 1, 2, 3, 4};
+    std::vector<uint> ts = {0, 1};
     std::string outdir = ".";
 };
 VISITABLE_STRUCT(Config,
@@ -212,9 +212,10 @@ static auto mass_source_term(const d_array_t& dm, double time, const Config& con
 
 static auto mdot_supply(double time)
 {
-    auto ell = 1.0;
-    auto a = binary_separation(time);
-    return exp(-3. / 5. * ell / pow(a, 5. / 6.));
+    // auto ell = 1.0;
+    // auto a = binary_separation(time);
+    // return exp(-3. / 5. * ell / pow(a, 5. / 6.));
+    return 1.0;
 }
 
 static auto mass_flux(const d_array_t& dm, double time, const Config& config)
@@ -256,6 +257,38 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config)
         }
         return 2.0 * pi * r * s_hat * v_hat;
     });
+}
+
+static auto jdot_viscosity(const d_array_t& dm, double time, const Config& config)
+{
+    auto rf = face_coordinates(config);
+    auto rc = cell_coordinates(config);
+    auto da = cell_surface_areas(config);
+    auto iv = range(rf.space());
+    auto nu = config.viscosity;
+    auto sigma = cache(dm / da);
+    return iv.map([=] (int i)
+    {
+        if (i == 0) {
+            i = 1;
+        }
+        if (i == rc.size()) {
+            i = rc.size() - 1;
+        }
+        auto pi = M_PI;
+        auto sm = sigma[i - 1];
+        auto sp = sigma[i + 0];
+        auto A = keplerian_omega_log_derivative(rf[i]);
+        auto r = rf[i];
+        auto g = r * 0.5 * (sm + sp) * nu * A;
+        return -2.0 * pi * r * g;
+    });
+}
+
+static auto jdot_advection(const d_array_t& dm, double time, const Config& config)
+{
+    auto rf = face_coordinates(config);
+    return mass_flux(dm, time, config) * rf.map(specific_angular_momentum);
 }
 
 static auto dm_dot(const d_array_t& dm, double time, const Config& config)
@@ -315,7 +348,7 @@ public:
     }
     bool use_persistent_session() const override
     {
-        return true;
+        return false;
     }
     double get_time(const State& state) const override
     {
@@ -381,8 +414,10 @@ public:
     {
         switch (column) {
         case 0: return "radius";
-        case 1: return "mdot";
-        case 2: return "sigma";
+        case 1: return "sigma";
+        case 2: return "mdot";
+        case 3: return "jdot_viscosity";
+        case 4: return "jdot_advection";
         }
         return nullptr;
     }
@@ -390,8 +425,10 @@ public:
     {
         switch (column) {
         case 0: return cache(cell_coordinates(config));
-        case 1: return cache(mass_flux(state.mass, state.time, config) * -1.0);
-        case 2: return cache(state.mass / cell_surface_areas(config));
+        case 1: return cache(state.mass / cell_surface_areas(config));
+        case 2: return cache(mass_flux(state.mass, state.time, config) * -1.0);
+        case 3: return cache(jdot_viscosity(state.mass, state.time, config) * -1.0);
+        case 4: return cache(jdot_advection(state.mass, state.time, config) * -1.0);
         }
         return {};
     }
