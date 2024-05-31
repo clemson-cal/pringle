@@ -57,7 +57,7 @@ def main(filenames: list[Path]):
         mdot = h5f["timeseries"]["mdot"][...]
         ax1.plot(time, mdot, label=filename)
 
-    # ax1.plot(time, Mdot(time), label="Fit", ls="--", lw=2.0, c="k")
+    ax1.plot(time, Mdot(time), label="Fit", ls="--", lw=2.0, c="k")
     ax1.set_ylabel(r"$\dot M$")
     ax1.set_xlabel(r"Time")
     ax1.legend()

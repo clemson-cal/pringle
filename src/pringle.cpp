@@ -195,27 +195,32 @@ static auto cell_surface_areas(const Config& config)
 
 static auto binary_separation(double time)
 {
-    return pow(time, 0.25);
+    return pow(max2(time, 1e-8), 0.25);
+}
+
+static auto viscosity(double r, const Config& config)
+{
+    return config.viscosity; // * sqrt(r);
 }
 
 static auto mass_source_term(const d_array_t& dm, double time, const Config& config)
 {
     auto rc = cell_coordinates(config);
-    auto nu = config.viscosity;
+    auto nu = rc.map([&config] (auto r) { return viscosity(r, config); });
     auto f0 = config.sink_rate; // sink rate, relative to local viscous rate
     auto a = binary_separation(time);
-    auto f = f0 * 1.5 * nu / a / a;
     return range(dm.space()).map([=] (int i) {
+        auto f = f0 * 1.5 * nu[i] / a / a;
         return -dm[i] * f * exp(-pow(rc[i] / a, 16.0));
     }).cache();
 }
 
 static auto mdot_supply(double time)
 {
-    // auto ell = 1.0;
-    // auto a = binary_separation(time);
-    // return exp(-3. / 5. * ell / pow(a, 5. / 6.));
-    return 1.0;
+    auto ell = 1.0;
+    auto a = binary_separation(time);
+    return exp(-3. / 5. * ell / pow(a, 5. / 6.));
+    // return 1.0;
 }
 
 static auto mass_flux(const d_array_t& dm, double time, const Config& config)
@@ -225,13 +230,13 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config)
     auto da = cell_surface_areas(config);
     auto iv = range(rf.space());
     auto ic = range(rc.space());
-    auto nu = config.viscosity;
+    auto nu = rc.map([&config] (auto r) { return viscosity(r, config); });
     auto mdot_outer = -mdot_supply(time);
     auto mdot_inner =  0.0;
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
-    auto g = ic.map([rc, sigma, A, nu] (int i) {
-        return rc[i] * sigma[i] * nu * A[i];
+    auto g = ic.map([rc, sigma, nu, A] (int i) {
+        return rc[i] * sigma[i] * nu[i] * A[i];
     }).cache();
     return iv.map([=] (int i)
     {
@@ -265,7 +270,6 @@ static auto jdot_viscosity(const d_array_t& dm, double time, const Config& confi
     auto rc = cell_coordinates(config);
     auto da = cell_surface_areas(config);
     auto iv = range(rf.space());
-    auto nu = config.viscosity;
     auto sigma = cache(dm / da);
     return iv.map([=] (int i)
     {
@@ -275,11 +279,12 @@ static auto jdot_viscosity(const d_array_t& dm, double time, const Config& confi
         if (i == rc.size()) {
             i = rc.size() - 1;
         }
-        auto pi = M_PI;
+        auto r = rf[i];
+        auto A = keplerian_omega_log_derivative(r);
+        auto nu = viscosity(r, config);
         auto sm = sigma[i - 1];
         auto sp = sigma[i + 0];
-        auto A = keplerian_omega_log_derivative(rf[i]);
-        auto r = rf[i];
+        auto pi = M_PI;
         auto g = r * 0.5 * (sm + sp) * nu * A;
         return -2.0 * pi * r * g;
     });
@@ -365,7 +370,7 @@ public:
             auto a = binary_separation(config.tstart);
             auto ell = 1.0;
             auto pi = M_PI;
-            auto nu = config.viscosity;
+            auto nu = viscosity(r, config);
             auto mdot = mdot_supply(config.tstart);
             if (r > a) {
                 return mdot / (3 * pi * nu) * (1.0 - ell * sqrt(a / r));
