@@ -67,7 +67,8 @@ using Product = d_array_t;
 struct Config
 {
     int fold = 1;
-    double sink_rate = 1e3;
+    bool contract = true;
+    double amin = 0.1;
     double viscosity = 1.0 / 6.0;
     double n = 0.0; // viscosity profile; n=1/2 for alpha
     double cpi = 0.0;
@@ -76,14 +77,15 @@ struct Config
     double cfl = 0.1;
     double tstart = 10.0;
     double tfinal = 1.0;
-    vec_t<double, 3> domain = {0.0, 10.0, 0.01}; // inner, outer, step
+    vec_t<double, 3> domain = {1.0, 10.0, 0.1}; // inner, outer, step
     std::vector<uint> sp = {0, 1, 2, 3, 4};
     std::vector<uint> ts = {0, 1};
     std::string outdir = ".";
 };
 VISITABLE_STRUCT(Config,
     fold,
-    sink_rate,
+    contract,
+    amin,
     viscosity,
     n,
     cpi,
@@ -118,7 +120,7 @@ VISITABLE_STRUCT(State, time, iter, mass);
 /**
  * Return the shear profile d(Omega) / d(log R)
  */
-auto keplerian_omega_log_derivative(double R)
+static auto keplerian_omega_log_derivative(double R)
 {
     return -1.5 * sqrt(GM / R / R / R);
 }
@@ -126,7 +128,7 @@ auto keplerian_omega_log_derivative(double R)
 /**
  * Keplerian orbital frequency at radius R
  */
-auto keplerian_omega(double R)
+static auto keplerian_omega(double R)
 {
     return sqrt(GM / R / R / R);
 }
@@ -134,7 +136,7 @@ auto keplerian_omega(double R)
 /**
  * Specific angular momentum l at radius R
  */
-auto specific_angular_momentum(double R)
+static auto specific_angular_momentum(double R)
 {
     return sqrt(GM * R);
 }
@@ -142,52 +144,92 @@ auto specific_angular_momentum(double R)
 /**
  * Specific angular momentum derivative, dl/dR, at radius R
  */
-auto specific_angular_momentum_derivative(double R)
+static auto specific_angular_momentum_derivative(double R)
 {
     return 0.5 * sqrt(GM / R);
 }
 
-
-
-
-static auto face_coordinates(const Config& config)
+static auto binary_separation(double time, const Config& config)
 {
-    auto r0 = config.domain[0];
-    auto r1 = config.domain[1];
-    auto dlogr = config.domain[2];
-    auto ni = int(log(r1 / r0) / dlogr);
-    auto ic = range(ni + 1);
-    return ic.map([=] (int i) { return r0 * exp(dlogr * i); });
-    // auto x0 = config.domain[0];
-    // auto x1 = config.domain[1];
-    // auto dx = config.domain[2];
-    // auto ni = int((x1 - x0) / dx);
-    // auto ic = range(ni + 1);
-    // auto xf = ic * dx + x0;
-    // return xf;
+    auto amin = config.amin;
+    auto tmin = pow(amin, 4.0);
+    if (! config.contract) {
+        return 1.0;
+    } else if (time > tmin) {
+        return pow(time, 0.25);
+    } else {
+        return amin;
+    }
 }
 
-static auto cell_coordinates(const Config& config)
+static auto binary_contraction_speed(double time, const Config& config)
 {
-    auto rf = face_coordinates(config);
+    auto amin = config.amin;
+    auto tmin = pow(amin, 4.0);
+    if (! config.contract) {
+        return 0.0;
+    } else if (time > tmin) {
+        return -0.25 * binary_separation(time, config) / time;
+    } else {
+        return amin;
+    }
+}
+
+static auto viscosity(double r, const Config& config)
+{
+    return config.viscosity * pow(r, config.n);
+}
+
+
+
+
+static auto face_coordinates(double time, const Config& config)
+{
+    // x is log-spaced between a and r1
+    // x(a) = 1
+    // x(r1) = x1
+    // r(x) = x0 * a + (r1 - x0 * a) * (x - x0) / (x1 - x0)
+    // v(x) = x0 * adot * [1 - (x - x0) / (x1 - x0)]
+    auto a = binary_separation(time, config);
+    auto x0 = config.domain[0];
+    auto x1 = config.domain[1];
+    auto r1 = x1;
+    auto dlogx = config.domain[2];
+    auto ni = int(log(x1) / dlogx);
+    auto ic = range(ni + 1);
+    return ic
+        .map([=] (int i) { return x0 * exp(dlogx * i); })
+        .map([=] (double x) { return x0 * a + (r1 - x0 * a) * (x - x0) / (x1 - x0); });
+}
+
+static auto face_speed(double time, const Config& config)
+{
+    auto adot = binary_contraction_speed(time, config);
+    auto x0 = config.domain[0];
+    auto x1 = config.domain[1];
+    auto r1 = x1;
+    auto dlogx = config.domain[2];
+    auto ni = int(log(x1) / dlogx);
+    auto ic = range(ni + 1);
+    return ic
+        .map([=] (int i) { return x0 * exp(dlogx * i); })
+        .map([=] (double x) { return x0 * adot * (1.0 - (x - x0) / (x1 - x0)); });
+}
+
+static auto cell_coordinates(double time, const Config& config)
+{
+    auto rf = face_coordinates(time, config);
     auto rc = range(rf.size() - 1).map([rf] (int i) {
         auto r0 = rf[i];
         auto r1 = rf[i + 1];
         return sqrt(r1 * r0);
     });
     return rc;
-    // auto x0 = config.domain[0];
-    // auto x1 = config.domain[1];
-    // auto dx = config.domain[2];
-    // auto ni = int((x1 - x0) / dx);
-    // auto ic = range(ni);
-    // auto xf = (ic + 0.5) * dx + x0;
-    // return xf;
 }
 
-static auto cell_lengths(const Config& config)
+static auto cell_lengths(double time, const Config& config)
 {
-    auto rf = face_coordinates(config);
+    auto rf = face_coordinates(time, config);
     auto dl = range(rf.size() - 1).map([rf] (int i) {
         auto r0 = rf[i];
         auto r1 = rf[i + 1];
@@ -196,9 +238,9 @@ static auto cell_lengths(const Config& config)
     return dl;
 }
 
-static auto cell_surface_areas(const Config& config)
+static auto cell_surface_areas(double time, const Config& config)
 {
-    auto rf = face_coordinates(config);
+    auto rf = face_coordinates(time, config);
     auto da = range(rf.size() - 1).map([rf] (int i) {
         auto r0 = rf[i];
         auto r1 = rf[i + 1];
@@ -208,46 +250,16 @@ static auto cell_surface_areas(const Config& config)
     return da;
 }
 
-static auto binary_separation(double time)
+static auto mass_flux(const d_array_t& dm, double time, const Config& config, bool lagrangian)
 {
-    return pow(max2(time, 1e-8), 0.25);
-}
-
-static auto viscosity(double r, const Config& config)
-{
-    return config.viscosity * pow(r, config.n);
-}
-
-static auto mass_source_term(const d_array_t& dm, double time, const Config& config)
-{
-    auto rc = cell_coordinates(config);
-    auto nu = rc.map([&config] (auto r) { return viscosity(r, config); });
-    auto f0 = config.sink_rate; // sink rate, relative to local viscous rate
-    auto a = binary_separation(time);
-    return range(dm.space()).map([=] (int i) {
-        auto f = f0 * 1.5 * nu[i] / a / a;
-        return -dm[i] * f * exp(-pow(rc[i] / a, 16.0));
-    }).cache();
-}
-
-static auto mdot_supply(double time)
-{
-    auto ell = 1.0;
-    auto a = binary_separation(time);
-    return exp(-3. / 5. * ell / pow(a, 5. / 6.));
-    // return 1.0;
-}
-
-static auto mass_flux(const d_array_t& dm, double time, const Config& config)
-{
-    auto rf = face_coordinates(config);
-    auto rc = cell_coordinates(config);
-    auto da = cell_surface_areas(config);
+    auto rf = face_coordinates(time, config).cache();
+    auto vf = face_speed(time, config).cache();
+    auto rc = cell_coordinates(time, config).cache();
+    auto da = cell_surface_areas(time, config).cache();
     auto iv = range(rf.space());
     auto ic = range(rc.space());
     auto nu = rc.map([&config] (auto r) { return viscosity(r, config); });
-    auto mdot_outer = -mdot_supply(time);
-    auto mdot_inner =  0.0;
+    auto mdot_outer = -1.0;
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
     auto g = ic.map([rc, sigma, nu, A] (int i) {
@@ -259,7 +271,7 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config)
             return mdot_outer;
         }
         if (i == 0) {
-            return mdot_inner;
+            i = i + 1;
         }
         auto r = rf[i];
         auto pi = M_PI;
@@ -275,15 +287,15 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config)
         if (s_hat < 0.0) {
             throw std::runtime_error(format("found negative sigma %f at position %f", s_hat, r));
         }
-        return 2.0 * pi * r * s_hat * v_hat;
+        return 2.0 * pi * r * s_hat * (v_hat - vf[i] * lagrangian);
     });
 }
 
-static auto jdot_viscosity(const d_array_t& dm, double time, const Config& config)
+static auto jdot_viscosity(const d_array_t& dm, double time, const Config& config, bool lagrangian)
 {
-    auto rf = face_coordinates(config);
-    auto rc = cell_coordinates(config);
-    auto da = cell_surface_areas(config);
+    auto rf = face_coordinates(time, config);
+    auto rc = cell_coordinates(time, config);
+    auto da = cell_surface_areas(time, config);
     auto iv = range(rf.space());
     auto sigma = cache(dm / da);
     return iv.map([=] (int i)
@@ -305,23 +317,23 @@ static auto jdot_viscosity(const d_array_t& dm, double time, const Config& confi
     });
 }
 
-static auto jdot_advection(const d_array_t& dm, double time, const Config& config)
+static auto jdot_advection(const d_array_t& dm, double time, const Config& config, bool lagrangian)
 {
-    auto rf = face_coordinates(config);
-    return mass_flux(dm, time, config) * rf.map(specific_angular_momentum);
+    auto rf = face_coordinates(time, config);
+    return mass_flux(dm, time, config, lagrangian) * rf.map(specific_angular_momentum);
 }
 
 static auto dm_dot(const d_array_t& dm, double time, const Config& config)
 {
-    auto rc = cell_coordinates(config);
+    auto rc = cell_coordinates(time, config);
     auto ic = range(rc.space());
-    auto fhat = mass_flux(dm, time, config).cache();
+    auto fhat = mass_flux(dm, time, config, true).cache();
     return ic.map([fhat] (int i)
     {
         auto fm = fhat[i];
         auto fp = fhat[i + 1];
         return fm - fp;
-    }) + mass_source_term(dm, time, config);
+    });
 }
 
 static auto next_dm(const d_array_t& dm, double time, const Config& config, double dt)
@@ -331,8 +343,9 @@ static auto next_dm(const d_array_t& dm, double time, const Config& config, doub
 
 static void update_state(State& state, const Config& config, double& timestep)
 {
-    auto nu = config.viscosity;    
-    auto dr = cell_lengths(config);
+    auto dr = cell_lengths(state.time, config);
+    auto rc = cell_coordinates(state.time, config);
+    auto nu = rc.map([&] (double r) { return viscosity(r, config); });
     auto dt = timestep = config.cfl * (dr * dr / nu)[0];
     state = State{
         state.time - dt,
@@ -382,19 +395,19 @@ public:
     {
         auto initial_sigma = [*this] (double r)
         {
-            auto a = binary_separation(config.tstart);
+            auto a = binary_separation(config.tstart, config);
             auto ell = 1.0;
             auto pi = M_PI;
             auto nu = viscosity(r, config);
-            auto mdot = mdot_supply(config.tstart);
+            auto mdot = 1.0;
             if (r > a) {
                 return mdot / (3 * pi * nu) * (1.0 - ell * sqrt(a / r));
             } else {
                 return 1e-9;
             }
         };
-        auto da = cell_surface_areas(config);
-        auto sigma = cell_coordinates(config).map(initial_sigma);
+        auto da = cell_surface_areas(config.tstart, config);
+        auto sigma = cell_coordinates(config.tstart, config).map(initial_sigma);
         state.time = config.tstart;
         state.iter = 0.0;
         state.mass = cache(sigma * da);
@@ -444,11 +457,11 @@ public:
     Product compute_product(const State& state, uint column) const override
     {
         switch (column) {
-        case 0: return cache(cell_coordinates(config));
-        case 1: return cache(state.mass / cell_surface_areas(config));
-        case 2: return cache(mass_flux(state.mass, state.time, config) * -1.0);
-        case 3: return cache(jdot_viscosity(state.mass, state.time, config) * -1.0);
-        case 4: return cache(jdot_advection(state.mass, state.time, config) * -1.0);
+        case 0: return cache(cell_coordinates(state.time, config));
+        case 1: return cache(state.mass / cell_surface_areas(state.time, config));
+        case 2: return cache(mass_flux(state.mass, state.time, config, false) * -1.0);
+        case 3: return cache(jdot_viscosity(state.mass, state.time, config, false) * -1.0);
+        case 4: return cache(jdot_advection(state.mass, state.time, config, false) * -1.0);
         }
         return {};
     }
@@ -468,7 +481,8 @@ public:
     {
         switch (column) {
         case 0: return state.time;
-        case 1: return -sum(mass_source_term(state.mass, state.time, config));
+        case 1: return mass_flux(state.mass, state.time, config, true)[0] * -1.0;
+        // -sum(mass_source_term(state.mass, state.time, config));
         }
         return 0.0;
     }
