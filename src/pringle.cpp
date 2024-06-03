@@ -69,6 +69,7 @@ struct Config
     int fold = 1;
     double sink_rate = 1e3;
     double viscosity = 1.0 / 6.0;
+    double n = 0.0; // viscosity profile; n=1/2 for alpha
     double cpi = 0.0;
     double spi = 1.0;
     double tsi = 0.1;
@@ -84,6 +85,7 @@ VISITABLE_STRUCT(Config,
     fold,
     sink_rate,
     viscosity,
+    n,
     cpi,
     spi,
     tsi,
@@ -150,24 +152,37 @@ auto specific_angular_momentum_derivative(double R)
 
 static auto face_coordinates(const Config& config)
 {
-    auto x0 = config.domain[0];
-    auto x1 = config.domain[1];
-    auto dx = config.domain[2];
-    auto ni = int((x1 - x0) / dx);
+    auto r0 = config.domain[0];
+    auto r1 = config.domain[1];
+    auto dlogr = config.domain[2];
+    auto ni = int(log(r1 / r0) / dlogr);
     auto ic = range(ni + 1);
-    auto xf = ic * dx + x0;
-    return xf;
+    return ic.map([=] (int i) { return r0 * exp(dlogr * i); });
+    // auto x0 = config.domain[0];
+    // auto x1 = config.domain[1];
+    // auto dx = config.domain[2];
+    // auto ni = int((x1 - x0) / dx);
+    // auto ic = range(ni + 1);
+    // auto xf = ic * dx + x0;
+    // return xf;
 }
 
 static auto cell_coordinates(const Config& config)
 {
-    auto x0 = config.domain[0];
-    auto x1 = config.domain[1];
-    auto dx = config.domain[2];
-    auto ni = int((x1 - x0) / dx);
-    auto ic = range(ni);
-    auto xf = (ic + 0.5) * dx + x0;
-    return xf;
+    auto rf = face_coordinates(config);
+    auto rc = range(rf.size() - 1).map([rf] (int i) {
+        auto r0 = rf[i];
+        auto r1 = rf[i + 1];
+        return sqrt(r1 * r0);
+    });
+    return rc;
+    // auto x0 = config.domain[0];
+    // auto x1 = config.domain[1];
+    // auto dx = config.domain[2];
+    // auto ni = int((x1 - x0) / dx);
+    // auto ic = range(ni);
+    // auto xf = (ic + 0.5) * dx + x0;
+    // return xf;
 }
 
 static auto cell_lengths(const Config& config)
@@ -200,7 +215,7 @@ static auto binary_separation(double time)
 
 static auto viscosity(double r, const Config& config)
 {
-    return config.viscosity; // * sqrt(r);
+    return config.viscosity * pow(r, config.n);
 }
 
 static auto mass_source_term(const d_array_t& dm, double time, const Config& config)
