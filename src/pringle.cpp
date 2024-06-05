@@ -171,13 +171,34 @@ static auto binary_contraction_speed(double time, const Config& config)
     } else if (time > tmin) {
         return -0.25 * binary_separation(time, config) / time;
     } else {
-        return amin;
+        return 0.0;
     }
 }
 
 static auto viscosity(double r, const Config& config)
 {
     return config.viscosity * pow(r, config.n);
+}
+
+static auto mdot_supply(double time, const Config& config)
+{
+    if (! config.contract) {
+        return 1.0;
+    } else if (time > 0.0) {
+        auto n = config.n;
+        auto p = (2 + n) / (2 - n);
+        auto tau = 1.0;
+        time = max2(time, 1.5 * tau);
+        return pow(1 - pow(time / tau, -p / 8.0), 1.0 / p);
+    } else {
+        auto n = config.n;
+        auto p = (2 + n) / (2 - n);
+        auto q = (2 + n) / 4;
+        auto kappa = 5.0 / 3.0; // determined empirically
+        auto tau = 1.0 / kappa;
+        time = max2(-time, 1.5 * tau);
+        return pow(1 - pow(time / tau, -p / 8.0), 1.0 / q);
+    }
 }
 
 
@@ -259,7 +280,7 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config, bo
     auto iv = range(rf.space());
     auto ic = range(rc.space());
     auto nu = rc.map([&config] (auto r) { return viscosity(r, config); });
-    auto mdot_outer = -1.0;
+    auto mdot_outer = -mdot_supply(time, config);
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
     auto g = ic.map([rc, sigma, nu, A] (int i) {
@@ -399,7 +420,7 @@ public:
             auto ell = 1.0;
             auto pi = M_PI;
             auto nu = viscosity(r, config);
-            auto mdot = 1.0;
+            auto mdot = mdot_supply(config.tstart, config);
             if (r > a) {
                 return mdot / (3 * pi * nu) * (1.0 - ell * sqrt(a / r));
             } else {
@@ -488,10 +509,11 @@ public:
     }
     vec_t<char, 256> status_message(const State& state, double secs_per_update) const override
     {
-        return format("[%04d] t=%lf dt=%.6e Mzps=%.2lf",
+        return format("[%04d] t=%lf dt=%.6e a=%.3f Mzps=%.2lf",
             get_iteration(state),
             state.time,
             timestep,
+            binary_separation(state.time, config),
             1e-6 * state.mass.size() / secs_per_update);
     }
 private:

@@ -1,47 +1,17 @@
 from pathlib import Path
 from numpy import exp
 
-ell = 1.0
-nub = 1.0 / 6.0
-G = 1.0
-M = 1.0
-Mdot_inf = 1.0
 
+def mdot_model(t, n: float = 0.0, tau: float = 1.0, kappa: float = 1.0):
+    from numpy import nan_to_num
 
-def nu(r):
-    return 1 / 6
-
-
-def a(t):
-    return t ** (1 / 4)
-
-
-def r_nu(t):
-    return t ** (2 / 3)
-
-
-def t_nu(r):
-    return r ** (3 / 2)
-
-
-def Mdot(t):
-    return Mdot_inf * exp(-3 * ell / (5 * a(t) ** (5 / 6)))
-
-
-def sigma_in(r, t):
-    return Mdot(t) / (3 * pi * nu(r)) * (1.0 - ell * (a(t) / r) ** (1 / 2))
-
-
-def sigma(r, t):
-    return (r < r_nu(t)) * sigma_in(r, t) + (r >= r_nu(t)) * sigma_in(r, t_nu(r))
-
-
-def r_star(t):
-    return ell**2 * a(t)
-
-
-def r_vac():
-    return 0.0 if ell <= 0.0 else ell ** (16 / 5)
+    tau1 = tau
+    tau2 = tau / kappa
+    p = (2 + n) / (2 - n)
+    q = (2 + n) / 4
+    pre = (1 - (+t / tau1) ** (-p / 8)) ** (1 / p)
+    pos = (1 - (-t / tau2) ** (-p / 8)) ** (1 / q)
+    return (t > tau1) * nan_to_num(pre) + (-t > tau2) * nan_to_num(pos)
 
 
 def main(filenames: list[Path]):
@@ -56,8 +26,9 @@ def main(filenames: list[Path]):
         time = h5f["timeseries"]["time"][...]
         mdot = h5f["timeseries"]["mdot"][...]
         ax1.plot(time, mdot, label=filename)
-
-    ax1.plot(time, Mdot(time), label="Fit", ls="--", lw=2.0, c="k")
+        n = h5f["config"]["n"][...]
+    ax1.plot(time, mdot_model(time, n=n), label="Fit", ls="--", lw=2.0, c="k")
+    ax1.invert_xaxis()
     ax1.set_ylabel(r"$\dot M$")
     ax1.set_xlabel(r"Time")
     ax1.legend()
