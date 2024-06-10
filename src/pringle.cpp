@@ -68,6 +68,7 @@ struct Config
 {
     int fold = 1;
     bool contract = true;
+    bool negative_torque = false;
     double amin = 0.1;
     double viscosity = 1.0 / 6.0;
     double n = 0.0; // viscosity profile; n=1/2 for alpha
@@ -85,6 +86,7 @@ struct Config
 VISITABLE_STRUCT(Config,
     fold,
     contract,
+    negative_torque,
     amin,
     viscosity,
     n,
@@ -188,16 +190,18 @@ static auto mdot_supply(double time, const Config& config)
         auto n = config.n;
         auto p = (2 + n) / (2 - n);
         auto tau = 1.0;
+        auto ell = config.negative_torque ? -1.0 : 1.0;
         time = max2(time, 1.5 * tau);
-        return pow(1 - pow(time / tau, -p / 8.0), 1.0 / p);
+        return pow(1 - ell * pow(time / tau, -p / 8.0), 1.0 / p);
     } else {
         auto n = config.n;
         auto p = (2 + n) / (2 - n);
         auto q = (2 + n) / 4;
         auto kappa = 5.0 / 3.0; // determined empirically
         auto tau = 1.0 / kappa;
+        auto ell = config.negative_torque ? -1.0 : 1.0;
         time = max2(-time, 1.5 * tau);
-        return pow(1 - pow(time / tau, -p / 8.0), 1.0 / q);
+        return pow(1 - ell * pow(time / tau, -p / 8.0), 1.0 / q);
     }
 }
 
@@ -280,6 +284,7 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config, bo
     auto iv = range(rf.space());
     auto ic = range(rc.space());
     auto nu = rc.map([&config] (auto r) { return viscosity(r, config); });
+    auto pi = M_PI;
     auto mdot_outer = -mdot_supply(time, config);
     auto sigma = cache(dm / da);
     auto A = rc.map(keplerian_omega_log_derivative);
@@ -288,14 +293,15 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config, bo
     }).cache();
     return iv.map([=] (int i)
     {
+        auto inner_bc = false;
         if (i == rc.size()) {
             return mdot_outer;
         }
-        if (i == 0) {
+        else if (i == 0) {
+            inner_bc = true;
             i = i + 1;
         }
         auto r = rf[i];
-        auto pi = M_PI;
         auto lp = specific_angular_momentum_derivative(r);
         auto rm = rc[i - 1];
         auto rp = rc[i + 0];
@@ -308,7 +314,19 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config, bo
         if (s_hat < 0.0) {
             throw std::runtime_error(format("found negative sigma %f at position %f", s_hat, r));
         }
-        return 2.0 * pi * r * s_hat * (v_hat - vf[i] * lagrangian);
+        auto mdot = 2.0 * pi * r * s_hat * (v_hat - vf[i] * lagrangian);
+        auto amin = config.amin;
+        auto tmin = pow(amin, 4.0);
+        if (inner_bc && config.negative_torque && time > tmin) {
+            auto ell = -1.0;
+            auto lbin = sqrt(binary_separation(time, config));
+            auto jdot_targ = (ell * lbin - 1.0) * mdot;
+            auto jdot_visc = -2.0 * pi * rf[0] * gm;
+            auto jdot = jdot_targ - jdot_visc;
+            return mdot + jdot / specific_angular_momentum(rf[0]);
+        } else {
+            return mdot;
+        }
     });
 }
 
@@ -417,7 +435,7 @@ public:
         auto initial_sigma = [*this] (double r)
         {
             auto a = binary_separation(config.tstart, config);
-            auto ell = 1.0;
+            auto ell = config.negative_torque ? -1.0 : 1.0;
             auto pi = M_PI;
             auto nu = viscosity(r, config);
             auto mdot = mdot_supply(config.tstart, config);
