@@ -27,7 +27,7 @@ def main(filenames: list[Path]):
         mdot = h5f["timeseries"]["mdot"][...]
         ax1.plot(time, mdot, label=filename)
         n = h5f["config"]["n"][...]
-    ax1.plot(time, mdot_model(time, n=n), label="Fit", ls="--", lw=2.0, c="k")
+    # ax1.plot(time, mdot_model(time, n=n), label="Fit", ls="--", lw=2.0, c="k")
     ax1.invert_xaxis()
     ax1.set_ylabel(r"$\dot M$")
     ax1.set_xlabel(r"Time")

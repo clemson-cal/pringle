@@ -320,7 +320,7 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config, bo
         if (inner_bc && config.negative_torque && time > tmin) {
             auto ell = -1.0;
             auto lbin = sqrt(binary_separation(time, config));
-            auto jdot_targ = (ell * lbin - 1.0) * mdot;
+            auto jdot_targ = (ell - 1.0) * lbin * mdot;
             auto jdot_visc = -2.0 * pi * rf[0] * gm;
             auto jdot = jdot_targ - jdot_visc;
             return mdot + jdot / specific_angular_momentum(rf[0]);
