@@ -291,16 +291,9 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config, bo
     auto g = ic.map([rc, sigma, nu, A] (int i) {
         return rc[i] * sigma[i] * nu[i] * A[i];
     }).cache();
-    return iv.map([=] (int i)
+
+    auto f = [=] (int i)
     {
-        auto inner_bc = false;
-        if (i == rc.size()) {
-            return mdot_outer;
-        }
-        else if (i == 0) {
-            inner_bc = true;
-            i = i + 1;
-        }
         auto r = rf[i];
         auto lp = specific_angular_momentum_derivative(r);
         auto rm = rc[i - 1];
@@ -314,18 +307,26 @@ static auto mass_flux(const d_array_t& dm, double time, const Config& config, bo
         if (s_hat < 0.0) {
             throw std::runtime_error(format("found negative sigma %f at position %f", s_hat, r));
         }
-        auto mdot = 2.0 * pi * r * s_hat * (v_hat - vf[i] * lagrangian);
-        auto amin = config.amin;
-        auto tmin = pow(amin, 4.0);
-        if (inner_bc && config.negative_torque && time > tmin) {
+        return 2.0 * pi * r * s_hat * (v_hat - vf[i] * lagrangian);
+    };
+    return iv.map([=] (int i)
+    {
+        if (i == rc.size()) {
+            return mdot_outer;
+        }
+        else if (i == 0 && config.negative_torque) {
+            auto lm = specific_angular_momentum(rf[0]);
+            auto lb = specific_angular_momentum(binary_separation(time, config));
+            auto jp = -g[0] * 2.0 * pi * rc[0];
             auto ell = -1.0;
-            auto lbin = sqrt(binary_separation(time, config));
-            auto jdot_targ = (ell - 1.0) * lbin * mdot;
-            auto jdot_visc = -2.0 * pi * rf[0] * gm;
-            auto jdot = jdot_targ - jdot_visc;
-            return mdot + jdot / specific_angular_momentum(rf[0]);
-        } else {
-            return mdot;
+            auto fm = -jp / (lb - lm * ell);
+            return fm;
+        }
+        else if (i == 0) {
+            return f(1);
+        }
+        else {
+            return f(i);
         }
     });
 }
