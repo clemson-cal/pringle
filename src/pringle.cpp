@@ -44,7 +44,7 @@ The code uses constant-nu viscosity with nu = 1 / 6:
 
 
 /**
- * 
+ *
  */
 using namespace vapor;
 using d_array_t = memory_backed_array_t<1, double, ref_counted_ptr_t>;
@@ -106,7 +106,7 @@ VISITABLE_STRUCT(Config,
 
 
 /**
- * 
+ *
  */
 struct State
 {
@@ -130,10 +130,10 @@ static auto keplerian_omega_log_derivative(double R)
 /**
  * Keplerian orbital frequency at radius R
  */
-static auto keplerian_omega(double R)
-{
-    return sqrt(GM / R / R / R);
-}
+// static auto keplerian_omega(double R)
+// {
+//     return sqrt(GM / R / R / R);
+// }
 
 /**
  * Specific angular momentum l at radius R
@@ -232,7 +232,7 @@ static auto face_speed(double time, const Config& config)
     auto adot = binary_contraction_speed(time, config);
     auto x0 = config.domain[0];
     auto x1 = config.domain[1];
-    auto r1 = x1;
+    // auto r1 = x1;
     auto dlogx = config.domain[2];
     auto ni = int(log(x1) / dlogx);
     auto ic = range(ni + 1);
@@ -398,7 +398,7 @@ static void update_state(State& state, const Config& config, double& timestep)
 
 
 /**
- * 
+ *
  */
 class Pringle : public Simulation<Config, State, Product>
 {
@@ -468,7 +468,7 @@ public:
         return config.fold;
     }
     double checkpoint_interval() const override
-    { 
+    {
         return config.cpi;
     }
     double product_interval() const override

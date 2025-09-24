@@ -44,7 +44,7 @@ struct Config
     double cpi = 0.0;
     double spi = 1.0;
     double tsi = 0.1;
-    double cfl = 0.1;
+    double cfl = 1.0;
     double tstart = 1.0;
     double tfinal = 1.0;
     vec_t<double, 3> domain = {0.1, 10.0, 0.1}; // inner, outer, step
@@ -131,19 +131,20 @@ static HD double integrate(F func, double a, double b)
 //   r0  - initial radius of the ring
 //   nu  - kinematic viscosity
 //
-static HD double ring_sigma(double m, double r, double t, double r0, double nu)
+static HD double ring_sigma(double m, double r, double t, double r0, double nu, double trunc=0.0)
 {
     double tau = 12.0 * nu * t / (r0 * r0);
     double x = r / r0;
+    if (trunc > 0.0 && (x - 1) * (x - 1) > trunc * tau) {
+        return 0.0;
+    }
     double z = 2.0 * x / tau;
     double prefac = m / (M_PI * r0 * r0 * tau * pow(x, 0.25));
     if (prefac != prefac) {
         print("[ring_sigma] bad parameters: m=", m, " r=", r, " t=", t, " r0=", r0, "\n");
         exit(1);
     }
-    if (m == 0.0) {
-        return 0.0;
-    } else if (z < 10.0) {
+    if (z < 10.0) {
         return prefac * exp(-(1.0 + x * x) / tau) * besselij(0.25, z);
     } else {
         return prefac * exp(-(1.0 + x * x) / tau + z) / sqrt(2.0 * M_PI * z);
@@ -160,7 +161,9 @@ static auto face_coordinates(const Config& config)
     auto dlogr = config.domain[2];
     auto ni = int(log(r1 / r0) / dlogr);
     auto ic = range(ni + 1);
-    return ic.map([=] (int i) { return r0 * exp(dlogr * i); });
+    return ic.map([=] (int i) {
+        return r0 * exp(dlogr * i);
+    });
 }
 
 static auto initial_mass(const Config& config)
@@ -168,7 +171,7 @@ static auto initial_mass(const Config& config)
     auto t = config.tstart;
     auto m = 1.0;
     auto r0 = 1.0;
-    auto nu = 1.0 / 6.0;
+    auto nu = config.viscosity;
     auto sigma = [=] (double r) {
         return 2 * M_PI * r * ring_sigma(m, r, t, r0, nu);
     };
@@ -188,7 +191,7 @@ static auto initial_angm(const Config& config)
     auto t = config.tstart;
     auto m = 1.0;
     auto r0 = 1.0;
-    auto nu = 1.0 / 6.0;
+    auto nu = config.viscosity;
     auto jdens = [=] (double r) {
         auto ell = sqrt(r);
         return 2 * M_PI * r * ring_sigma(m, r, t, r0, nu) * ell;
@@ -209,19 +212,18 @@ static auto initial_angm(const Config& config)
  * a time step dt.
  *
  * The mass array represents a sequence of N delta-function-like rings with
- * corresponding masses. Each ring expands over a time duration dt (assumed
- * to be dt=1e-3). The new mass and angular momentum at time t + dt in each
- * annulus are computed by integrating the surface densities and angular
- * momentum densities contributed by all the spreading rings (from all other
- * annuli) over the annulus. The ring positions are obtained as the square
- * of J / M in each annulus.
+ * corresponding masses. Each ring expands over a time duration dt. The new
+ * mass and angular momentum at time t + dt in each annulus are computed by
+ * integrating the surface densities and angular momentum densities
+ * contributed by all the spreading rings (from all other annuli) over the
+ * annulus. The ring positions are obtained as the square of J / M in each
+ * annulus.
  */
 static void update_state(State& state, const Config& config)
 {
-    constexpr double dt = 1e-3;
     auto nu = config.viscosity;
     auto num_zones = state.mass.size();
-    auto rf = face_coordinates(config);
+    auto rf = face_coordinates(config).cache();
     auto M = state.mass;
     auto J = state.angm;
 
@@ -230,14 +232,22 @@ static void update_state(State& state, const Config& config)
         if (M[i] == 0.0) {
             return 0.5 * (rf[i] + rf[i + 1]);
         }
-        return pow(J[i] / M[i], 2.0);
+        auto rc = pow(J[i] / M[i], 2.0);
+        if (! (rf[i] < rc && rc < rf[i + 1])) {
+            printf("[update_state] ring %d has moved outside its annulus\n", i);
+            exit(1);
+        }
+        return rc;
     });
+
+    auto dt = config.cfl * min(rc * rc / (12.0 * nu));
+    // print("dt=", dt, "\n");
 
     // Define the surface density function contributed by all rings
     auto new_sigma = [=] (double r) {
         double s = 0.0;
         for (int j = 0; j < num_zones; ++j) {
-            s += ring_sigma(M[j], r, dt, rc[j], nu);
+            s += ring_sigma(M[j], r, dt, rc[j], nu, 25.0);
         }
         return s;
     };
@@ -366,10 +376,10 @@ public:
     }
     vec_t<char, 256> status_message(const State& state, double secs_per_update) const override
     {
-        return format("[%04d] t=%lf Mzps=%.2lf",
+        return format("[%04d] t=%lf kzps=%.4lf",
             get_iteration(state),
             state.time,
-            1e-6 * state.mass.size() / secs_per_update);
+            1e-3 * state.mass.size() / secs_per_update);
     }
 };
 
