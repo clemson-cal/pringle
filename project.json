@@ -1,11 +1,14 @@
 {
-    "src": "src",
-    "bin": ".",
-    "build": "build",
-    "vapor": "vapor",
-    "programs": {
-        "pringle": {
-            "deps": ["hdf5"]
-        }
+  "src": "src",
+  "bin": ".",
+  "build": "build",
+  "vapor": "vapor",
+  "programs": {
+    "pringle": {
+      "deps": ["hdf5"]
+    },
+    "ruffle": {
+      "deps": ["hdf5"]
     }
+  }
 }
