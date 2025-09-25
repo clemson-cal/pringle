@@ -29,6 +29,8 @@ SOFTWARE.
 using namespace vapor;
 using d_array_t = memory_backed_array_t<1, double, ref_counted_ptr_t>;
 using Product = d_array_t;
+#define min2(a, b) ((a) < (b) ? (a) : (b))
+#define max2(a, b) ((a) > (b) ? (a) : (b))
 
 
 
@@ -39,8 +41,9 @@ using Product = d_array_t;
 struct Config
 {
     int fold = 1;
+    int kernel_radius = 0; // zones included in the transport integral; zero means use the whole grid, N^2
     double viscosity = 1.0 / 6.0;
-    double n = 0.0; // viscosity profile; n=1/2 for alpha
+    // double n = 0.0; // viscosity profile; n=1/2 for alpha
     double cpi = 0.0;
     double spi = 1.0;
     double tsi = 0.1;
@@ -54,8 +57,9 @@ struct Config
 };
 VISITABLE_STRUCT(Config,
     fold,
+    kernel_radius,
     viscosity,
-    n,
+    // n,
     cpi,
     spi,
     tsi,
@@ -131,23 +135,17 @@ static HD double integrate(F func, double a, double b)
 //   r0  - initial radius of the ring
 //   nu  - kinematic viscosity
 //
-static HD double ring_sigma(double m, double r, double t, double r0, double nu, double trunc=0.0)
+static HD double ring_sigma(double m, double r, double t, double r0, double nu)
 {
+    constexpr auto ATMO = 1e-12;
     double tau = 12.0 * nu * t / (r0 * r0);
     double x = r / r0;
-    if (trunc > 0.0 && (x - 1) * (x - 1) > trunc * tau) {
-        return 0.0;
-    }
     double z = 2.0 * x / tau;
     double prefac = m / (M_PI * r0 * r0 * tau * pow(x, 0.25));
-    if (prefac != prefac) {
-        print("[ring_sigma] bad parameters: m=", m, " r=", r, " t=", t, " r0=", r0, "\n");
-        exit(1);
-    }
     if (z < 10.0) {
-        return prefac * exp(-(1.0 + x * x) / tau) * besselij(0.25, z);
+        return ATMO + prefac * exp(-(1.0 + x * x) / tau) * besselij(0.25, z);
     } else {
-        return prefac * exp(-(1.0 + x * x) / tau + z) / sqrt(2.0 * M_PI * z);
+        return ATMO + prefac * exp(-(1.0 + x * x) / tau + z) / sqrt(2.0 * M_PI * z);
     }
 }
 
@@ -182,9 +180,6 @@ static auto initial_mass(const Config& config)
         return integrate(sigma, r0, r1);
     }).cache();
 }
-
-
-
 
 static auto initial_angm(const Config& config)
 {
@@ -222,32 +217,25 @@ static auto initial_angm(const Config& config)
 static void update_state(State& state, const Config& config)
 {
     auto nu = config.viscosity;
-    auto num_zones = state.mass.size();
+    auto num_zones = int(state.mass.size());
     auto rf = face_coordinates(config).cache();
     auto M = state.mass;
     auto J = state.angm;
+    auto kernel_radius = config.kernel_radius == 0 ? num_zones : config.kernel_radius;
 
     // Compute the radii of the rings based on angular momentum conservation
     auto rc = range(num_zones).map([=] (int i) {
-        if (M[i] == 0.0) {
-            return 0.5 * (rf[i] + rf[i + 1]);
-        }
-        auto rc = pow(J[i] / M[i], 2.0);
-        if (! (rf[i] < rc && rc < rf[i + 1])) {
-            printf("[update_state] ring %d has moved outside its annulus\n", i);
-            exit(1);
-        }
-        return rc;
+        return pow(J[i] / M[i], 2.0);
     });
-
     auto dt = config.cfl * min(rc * rc / (12.0 * nu));
-    // print("dt=", dt, "\n");
 
     // Define the surface density function contributed by all rings
-    auto new_sigma = [=] (double r) {
-        double s = 0.0;
-        for (int j = 0; j < num_zones; ++j) {
-            s += ring_sigma(M[j], r, dt, rc[j], nu, 25.0);
+    auto new_sigma = [=] (double r, int i) {
+        auto s = 0.0;
+        auto j0 = max2(i - kernel_radius, 0);
+        auto j1 = min2(i + kernel_radius, num_zones);
+        for (int j = j0; j < j1; ++j) {
+            s += ring_sigma(M[j], r, dt, rc[j], nu);
         }
         return s;
     };
@@ -255,7 +243,7 @@ static void update_state(State& state, const Config& config)
     // Compute the new mass in each annulus
     auto new_mass = range(num_zones).map([=] (int i) {
         return integrate([=] (double r) {
-            return 2 * M_PI * r * new_sigma(r);
+            return 2 * M_PI * r * new_sigma(r, i);
         }, rf[i], rf[i + 1]);
     });
 
@@ -263,7 +251,7 @@ static void update_state(State& state, const Config& config)
     auto new_angm = range(num_zones).map([=] (int i) {
         return integrate([=] (double r) {
             auto ell = sqrt(r);
-            return 2 * M_PI * r * new_sigma(r) * ell;
+            return 2 * M_PI * r * new_sigma(r, i) * ell;
         }, rf[i], rf[i + 1]);
     });
 
