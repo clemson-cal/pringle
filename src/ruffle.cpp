@@ -22,12 +22,13 @@ SOFTWARE.
 
 ================================================================================
 */
+#define VAPOR_USE_SHARED_PTR_ALLOCATOR // needed for OpenMP
 #include <cmath>
 #include "vapor/vapor.hpp"
 
-
 using namespace vapor;
-using d_array_t = memory_backed_array_t<1, double, ref_counted_ptr_t>;
+using d_array_t = memory_backed_array_t<1, double, std::shared_ptr>;
+// using d_array_t = memory_backed_array_t<1, double, ref_counted_ptr_t>;
 using Product = d_array_t;
 #define min2(a, b) ((a) < (b) ? (a) : (b))
 #define max2(a, b) ((a) > (b) ? (a) : (b))
