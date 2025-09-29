@@ -18,15 +18,22 @@ def main():
 
     for filename in args.filenames:
         with h5py.File(filename, 'r') as file:
-            time = file['state']['time'][()]
-            mass = file['state']['mass'][:]
-            r0, r1, dlogr = file['config']['domain'][()]
-            nu = file['config']['viscosity'][()]
-
-        rf = np.logspace(np.log10(r0), np.log10(r1), len(mass) + 1)
-        rc = 0.5 * (rf[:-1] + rf[1:])
-        dA = np.pi * np.diff(rf**2)
-        sigma = mass / dA
+            if 'chkpt' in filename:
+                time = file['state']['time'][()]
+                mass = file['state']['mass'][:]
+                nu = file['config']['viscosity'][()]
+                r0, r1, dlogr = file['config']['domain'][()]
+                rf = np.logspace(np.log10(r0), np.log10(r1), len(mass) + 1)
+                rc = 0.5 * (rf[:-1] + rf[1:])
+                dA = np.pi * np.diff(rf**2)
+                sigma = mass / dA
+            elif 'prods' in filename:
+                time = file['__time__'][()]
+                nu = file['__config__']['viscosity'][()]
+                rc = file['r'][()]
+                sigma = file['sigma'][()]
+            else:
+                raise RuntimeError("must be a checkpoint or products file")
 
         plt.plot(rc, sigma, label=filename)
 

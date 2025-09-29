@@ -25,6 +25,7 @@ SOFTWARE.
 #define VAPOR_USE_SHARED_PTR_ALLOCATOR // needed for OpenMP
 #include <cmath>
 #include "vapor/vapor.hpp"
+constexpr auto SIGMA_FLOOR = 1e-12;
 
 using namespace vapor;
 using d_array_t = memory_backed_array_t<1, double, std::shared_ptr>;
@@ -83,10 +84,12 @@ struct State
 {
     double time;
     double iter;
+    double mass_accreted;
+    double angm_accreted;
     d_array_t mass;
     d_array_t angm;
 };
-VISITABLE_STRUCT(State, time, iter, mass, angm);
+VISITABLE_STRUCT(State, time, iter, mass_accreted, angm_accreted, mass, angm);
 
 
 
@@ -124,6 +127,15 @@ static HD double integrate(F func, double a, double b)
 }
 
 
+template <typename A>
+static auto diff(A y)
+{
+    return range(y.size() - 1).map([y] (int i) {
+        return y[i + 1] - y[i];
+    });
+}
+
+
 
 
 //
@@ -138,15 +150,14 @@ static HD double integrate(F func, double a, double b)
 //
 static HD double ring_sigma(double m, double r, double t, double r0, double nu)
 {
-    constexpr auto ATMO = 1e-12;
     double tau = 12.0 * nu * t / (r0 * r0);
     double x = r / r0;
     double z = 2.0 * x / tau;
     double prefac = m / (M_PI * r0 * r0 * tau * pow(x, 0.25));
     if (z < 10.0) {
-        return ATMO + prefac * exp(-(1.0 + x * x) / tau) * besselij(0.25, z);
+        return SIGMA_FLOOR + prefac * exp(-(1.0 + x * x) / tau) * besselij(0.25, z);
     } else {
-        return ATMO + prefac * exp(-(1.0 + x * x) / tau + z) / sqrt(2.0 * M_PI * z);
+        return SIGMA_FLOOR + prefac * exp(-(1.0 + x * x) / tau + z) / sqrt(2.0 * M_PI * z);
     }
 }
 
@@ -161,7 +172,11 @@ static auto face_coordinates(const Config& config)
     auto ni = int(log(r1 / r0) / dlogr);
     auto ic = range(ni + 1);
     return ic.map([=] (int i) {
-        return r0 * exp(dlogr * i);
+        if (i == 0) {
+            return 0.0;
+        } else {
+            return r0 * exp(dlogr * i);
+        }
     });
 }
 
@@ -224,14 +239,14 @@ static void update_state(State& state, const Config& config)
     auto J = state.angm;
     auto kernel_radius = config.kernel_radius == 0 ? num_zones : config.kernel_radius;
 
-    // Compute the radii of the rings based on angular momentum conservation
-    auto rc = range(num_zones).map([=] (int i) {
-        return pow(J[i] / M[i], 2.0);
-    });
+    auto rc = J * J / M / M;
     auto dt = config.cfl * min(rc * rc / (12.0 * nu));
 
     // Define the surface density function contributed by all rings
-    auto new_sigma = [=] (double r, int i) {
+    auto new_sigma = [=] (double r, int i, bool zero_inner) {
+        if (zero_inner && i == 0) {
+            return SIGMA_FLOOR;
+        }
         auto s = 0.0;
         auto j0 = max2(i - kernel_radius, 0);
         auto j1 = min2(i + kernel_radius, num_zones);
@@ -241,24 +256,31 @@ static void update_state(State& state, const Config& config)
         return s;
     };
 
+    // Define the angular momentum density function contributed by all rings
+    auto new_angm_density = [=] (double r, int i, bool zero_inner) {
+        auto ell = sqrt(r);
+        return new_sigma(r, i, zero_inner) * ell;
+    };
+
     // Compute the new mass in each annulus
     auto new_mass = range(num_zones).map([=] (int i) {
         return integrate([=] (double r) {
-            return 2 * M_PI * r * new_sigma(r, i);
+            return 2 * M_PI * r * new_sigma(r, i, true);
         }, rf[i], rf[i + 1]);
     });
 
     // Compute the new angular momentum in each annulus
     auto new_angm = range(num_zones).map([=] (int i) {
         return integrate([=] (double r) {
-            auto ell = sqrt(r);
-            return 2 * M_PI * r * new_sigma(r, i) * ell;
+            return 2 * M_PI * r * new_angm_density(r, i, true);
         }, rf[i], rf[i + 1]);
     });
 
     // Update the state with the new mass and angular momentum arrays
     state.mass = new_mass.cache();
     state.angm = new_angm.cache();
+    state.mass_accreted += integrate([=] (double r) { return 2 * M_PI * r * new_sigma(r, 0, false); }, rf[0], rf[1]);
+    state.angm_accreted += integrate([=] (double r) { return 2 * M_PI * r * new_angm_density(r, 0, false); }, rf[0], rf[1]);
     state.time += dt;
     state.iter += 1.0;
 }
@@ -306,6 +328,8 @@ public:
         state.iter = 0.0;
         state.mass = initial_mass(config);
         state.angm = initial_angm(config);
+        state.mass_accreted = 0.0;
+        state.angm_accreted = 0.0;
     }
     void update(State& state) const override
     {
@@ -338,12 +362,22 @@ public:
     const char* get_product_name(uint column) const override
     {
         switch (column) {
+            case 0: return "r";
+            case 1: return "sigma";
         }
         return nullptr;
     }
     Product compute_product(const State& state, uint column) const override
     {
+        auto num_zones = int(state.mass.size());
+        auto rf = face_coordinates(config).cache();
+        auto M = state.mass;
+        auto J = state.angm;
+        auto rc = J * J / M / M;
+        auto sigma = M / diff(rf * rf) / M_PI;
         switch (column) {
+            case 0: return rc.cache();
+            case 1: return sigma.cache();
         }
         return {};
     }
@@ -354,12 +388,16 @@ public:
     const char* get_timeseries_name(uint column) const override
     {
         switch (column) {
+            case 0: return "time";
+            case 1: return "mass_accreted";
         }
         return nullptr;
     }
     double compute_timeseries_sample(const State& state, uint column) const override
     {
         switch (column) {
+            case 0: return state.time;
+            case 1: return state.mass_accreted;
         }
         return 0.0;
     }
