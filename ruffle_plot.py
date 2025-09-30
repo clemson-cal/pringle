@@ -37,8 +37,8 @@ def main():
 
         plt.plot(rc, sigma, label=filename)
 
-    sigma_true = [ring_sigma(1.0, r, time, 1.0, nu) for r in rc]
-    plt.plot(rc, sigma_true, '--', c='k', lw=1.0)
+    # sigma_true = [ring_sigma(1.0, r, time, 1.0, nu) for r in rc]
+    # plt.plot(rc, sigma_true, '--', c='k', lw=1.0)
 
     plt.xlabel(r'$r$')
     plt.ylabel(r'$\Sigma$')

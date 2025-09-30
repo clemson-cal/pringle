@@ -13,11 +13,16 @@ def main():
     with h5py.File(filename, 'r') as file:
         time = file['timeseries']['time'][()]
         mass_accreted = file['timeseries']['mass_accreted'][()]
+        mass_expelled = file['timeseries']['mass_expelled'][()]
 
-    Mdot = np.diff(mass_accreted) / np.diff(time)
-    plt.plot(time[1:], Mdot)
+    Mdot_accreted = np.diff(mass_accreted) / np.diff(time)
+    Mdot_expelled = np.diff(mass_expelled) / np.diff(time)
+
+    plt.plot(time[1:], Mdot_accreted, label=r"$\dot M_{accreted}$")
+    plt.plot(time[1:], Mdot_expelled, label=r"$\dot M_{expelled}$")
     plt.xlabel(r"$t$")
     plt.ylabel(r"$\dot M$")
+    plt.legend()
     plt.grid(True)
     plt.show()
 
