@@ -137,7 +137,6 @@ static auto diff(A y)
 
 
 
-
 //
 // Equations for viscous spreading ring
 //
@@ -172,11 +171,7 @@ static auto face_coordinates(const Config& config)
     auto ni = int(log(r1 / r0) / dlogr);
     auto ic = range(ni + 1);
     return ic.map([=] (int i) {
-        if (i == 0) {
-            return 0.0;
-        } else {
-            return r0 * exp(dlogr * i);
-        }
+        return r0 * exp(dlogr * i);
     });
 }
 
@@ -239,14 +234,23 @@ static void update_state(State& state, const Config& config)
     auto J = state.angm;
     auto kernel_radius = config.kernel_radius == 0 ? num_zones : config.kernel_radius;
 
-    auto rc = J * J / M / M;
+    auto rc = (J * J / M / M).cache();
     auto dt = config.cfl * min(rc * rc / (12.0 * nu));
 
-    // Define the surface density function contributed by all rings
-    auto new_sigma = [=] (double r, int i, bool zero_inner) {
-        if (zero_inner && i == 0) {
-            return SIGMA_FLOOR;
+    // Define the mass flowing into the "void" inside the innermost zone
+    auto mass_accreted = integrate([=] (double r) {
+        auto s = 0.0;
+        for (int j = 0; j < num_zones; ++j) {
+            s += ring_sigma(M[j], r, dt, rc[j], nu);
         }
+        return s;
+    }, 0.0, rf[1]);
+
+    // Define the angular momentum flowing into the "void" inside the innermost zone
+    auto angm_accreted = mass_accreted * sqrt(rf[0]);
+
+    // Define the surface density function contributed by all rings
+    auto new_sigma = [=] (double r, int i) {
         auto s = 0.0;
         auto j0 = max2(i - kernel_radius, 0);
         auto j1 = min2(i + kernel_radius, num_zones);
@@ -256,31 +260,26 @@ static void update_state(State& state, const Config& config)
         return s;
     };
 
-    // Define the angular momentum density function contributed by all rings
-    auto new_angm_density = [=] (double r, int i, bool zero_inner) {
-        auto ell = sqrt(r);
-        return new_sigma(r, i, zero_inner) * ell;
-    };
-
     // Compute the new mass in each annulus
     auto new_mass = range(num_zones).map([=] (int i) {
         return integrate([=] (double r) {
-            return 2 * M_PI * r * new_sigma(r, i, true);
+            return 2 * M_PI * r * new_sigma(r, i);
         }, rf[i], rf[i + 1]);
     });
 
     // Compute the new angular momentum in each annulus
     auto new_angm = range(num_zones).map([=] (int i) {
         return integrate([=] (double r) {
-            return 2 * M_PI * r * new_angm_density(r, i, true);
+            auto ell = sqrt(r);
+            return 2 * M_PI * r * new_sigma(r, i) * ell;
         }, rf[i], rf[i + 1]);
     });
 
     // Update the state with the new mass and angular momentum arrays
     state.mass = new_mass.cache();
     state.angm = new_angm.cache();
-    state.mass_accreted += integrate([=] (double r) { return 2 * M_PI * r * new_sigma(r, 0, false); }, rf[0], rf[1]);
-    state.angm_accreted += integrate([=] (double r) { return 2 * M_PI * r * new_angm_density(r, 0, false); }, rf[0], rf[1]);
+    state.mass_accreted += mass_accreted;
+    state.angm_accreted += angm_accreted;
     state.time += dt;
     state.iter += 1.0;
 }
@@ -390,6 +389,7 @@ public:
         switch (column) {
             case 0: return "time";
             case 1: return "mass_accreted";
+            case 2: return "angm_accreted";
         }
         return nullptr;
     }
@@ -398,6 +398,7 @@ public:
         switch (column) {
             case 0: return state.time;
             case 1: return state.mass_accreted;
+            case 2: return state.angm_accreted;
         }
         return 0.0;
     }
