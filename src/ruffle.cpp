@@ -24,6 +24,7 @@ SOFTWARE.
 */
 #define VAPOR_USE_SHARED_PTR_ALLOCATOR // needed for OpenMP
 #include <cmath>
+#include <random>
 #include "vapor/vapor.hpp"
 constexpr auto SIGMA_FLOOR = 1e-12;
 
@@ -33,6 +34,28 @@ using d_array_t = memory_backed_array_t<1, double, std::shared_ptr>;
 using Product = d_array_t;
 #define min2(a, b) ((a) < (b) ? (a) : (b))
 #define max2(a, b) ((a) > (b) ? (a) : (b))
+
+// Simple array sum utility (host-side)
+// Overload for summing realized device/host arrays
+static double sum_array(const d_array_t& a)
+{
+    double s = 0.0;
+    for (int i = 0; i < int(a.size()); ++i) {
+        s += a[i];
+    }
+    return s;
+}
+
+// Template sum for mapped arrays not yet cached into d_array_t
+template <typename Arr>
+static double sum_array(const Arr& a)
+{
+    double s = 0.0;
+    for (int i = 0; i < int(a.size()); ++i) {
+        s += a[i];
+    }
+    return s;
+}
 
 
 
@@ -86,6 +109,8 @@ struct State
 {
     double time;
     double iter;
+    // CHANGE: track total mass injected so it can be plotted and compared
+    double mass_injected;
     double mass_accreted;
     double angm_accreted;
     double mass_expelled;
@@ -96,6 +121,7 @@ struct State
 VISITABLE_STRUCT(State,
     time,
     iter,
+    mass_injected,
     mass_accreted,
     angm_accreted,
     mass_expelled,
@@ -148,6 +174,37 @@ static auto diff(A y)
     });
 }
 
+
+
+//
+// Random helpers for per-timestep injection fluctuations
+//
+static auto rng() -> std::mt19937&
+{
+    static std::mt19937 gen(std::random_device{}());
+    return gen;
+}
+
+// Sample a truncated exponential on [amin, amax] with scale lambda (mean=lambda)
+// Returned value is guaranteed within [amin, amax]
+static double sample_truncated_exponential(double amin, double amax, double lambda)
+{
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    double u = U(rng());
+    double umin = 1.0 - std::exp(-amin / lambda);
+    double umax = 1.0 - std::exp(-amax / lambda);
+    double ubar = u * (umax - umin) + umin;
+    return -lambda * std::log(1.0 - ubar);
+}
+
+// Sample a symmetric, zero-mean fluctuation using a truncated exponential tail
+// on [0, amax], and a random sign. The expected value is zero.
+static double sample_symmetric_truncated_exponential(double amax, double lambda)
+{
+    double mag = sample_truncated_exponential(0.0, amax, lambda);
+    std::uniform_int_distribution<int> B(0, 1);
+    return B(rng()) ? mag : -mag;
+}
 
 
 //
@@ -250,8 +307,13 @@ static void update_state(State& state, const Config& config)
     auto J = state.angm;
     auto kernel_radius = config.kernel_radius == 0 ? num_zones : config.kernel_radius;
 
-    auto injection_zone = num_zones / 10;
-    auto mdot = 1.0;
+    // NOTE (changed): injection location is currently fixed. Consider parameterizing.
+    //auto injection_zone = num_zones / 10;
+    auto injection_zone = 229;
+    // CHANGE: baseline injection rate with zero-mean bounded random fluctuations
+    auto base_mdot = 1.0;
+    auto fluct = sample_symmetric_truncated_exponential(0.8, 0.3);
+    auto mdot = base_mdot * (1.0 + fluct);
 
     auto rc = (J * J / M / M).cache();
     auto dt = config.cfl * (rc * rc / (12.0 * nu))[0];
@@ -274,27 +336,17 @@ static void update_state(State& state, const Config& config)
         }
     });
 
-    // Mass flowing into the "void" inside the innermost zone
+    // CHANGE: fix accretion integral upper limit to rf[0] (inner boundary)
     auto mass_accreted = integrate([=] (double r) {
         auto s = 0.0;
         for (int j = 0; j < num_zones; ++j) {
             s += 2 * M_PI * r * ring_sigma(M[j], r, dt, rc[j], nu);
         }
         return s;
-    }, 0.0, rf[1]);
+    }, 0.0, rf[0]);
 
     // Angular momentum flowing into the "void" inside the innermost zone
     auto angm_accreted = mass_accreted * sqrt(rf[0]);
-
-    auto mass_expelled = integrate([=] (double r) {
-        auto s = 0.0;
-        for (int j = 0; j < num_zones; ++j) {
-            s += 2 * M_PI * r * ring_sigma(M[j], r, dt, rc[j], nu);
-        }
-        return s;
-    }, rf[num_zones], rf[num_zones] * 2.0);
-
-    auto angm_expelled = mass_expelled * sqrt(rf[num_zones]);
 
     // Define the surface density function contributed by all rings
     auto new_sigma = [=] (double r, int i) {
@@ -306,6 +358,19 @@ static void update_state(State& state, const Config& config)
         }
         return s;
     };
+
+    // CHANGE: outflow through the outer boundary estimated via conservation
+    // New total mass before boundary accounting
+    auto tentative_mass = range(num_zones).map([=] (int i) {
+        return integrate([=] (double r) {
+            return 2 * M_PI * r * new_sigma(r, i);
+        }, rf[i], rf[i + 1]);
+    });
+    double total_mass_before = sum_array(M);
+    double total_mass_after  = sum_array(tentative_mass.cache());
+    double mass_loss_total   = total_mass_before - total_mass_after; // removed injected term
+    double mass_expelled = max2(mass_loss_total - mass_accreted, 0.0);
+    double angm_expelled = mass_expelled * sqrt(rf[num_zones]);
 
     // Compute the new mass in each annulus
     auto new_mass = range(num_zones).map([=] (int i) {
@@ -325,6 +390,8 @@ static void update_state(State& state, const Config& config)
     // Update the state with the new mass and angular momentum arrays
     state.mass = new_mass.cache();
     state.angm = new_angm.cache();
+    // CHANGE: accumulate mass injected in the timeseries
+    state.mass_injected += mdot * dt;
     state.mass_accreted += mass_accreted;
     state.angm_accreted += angm_accreted;
     state.mass_expelled += mass_expelled;
@@ -376,8 +443,11 @@ public:
         state.iter = 0.0;
         state.mass = initial_mass(config);
         state.angm = initial_angm(config);
+        state.mass_injected = 0.0;
         state.mass_accreted = 0.0;
         state.angm_accreted = 0.0;
+        state.mass_expelled = 0.0;
+        state.angm_expelled = 0.0;
     }
     void update(State& state) const override
     {
@@ -437,10 +507,11 @@ public:
     {
         switch (column) {
             case 0: return "time";
-            case 1: return "mass_accreted";
-            case 2: return "angm_accreted";
-            case 3: return "mass_expelled";
-            case 4: return "angm_expelled";
+            case 1: return "mass_injected";   // CHANGE: new series
+            case 2: return "mass_accreted";
+            case 3: return "angm_accreted";
+            case 4: return "mass_expelled";
+            case 5: return "angm_expelled";
         }
         return nullptr;
     }
@@ -448,10 +519,11 @@ public:
     {
         switch (column) {
             case 0: return state.time;
-            case 1: return state.mass_accreted;
-            case 2: return state.angm_accreted;
-            case 3: return state.mass_expelled;
-            case 4: return state.angm_expelled;
+            case 1: return state.mass_injected;  // CHANGE: new series
+            case 2: return state.mass_accreted;
+            case 3: return state.angm_accreted;
+            case 4: return state.mass_expelled;
+            case 5: return state.angm_expelled;
         }
         return 0.0;
     }
@@ -478,4 +550,5 @@ int main(int argc, const char **argv)
         vapor::print("\n");
     }
     return 0;
-}
+}  
+
