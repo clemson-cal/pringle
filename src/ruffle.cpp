@@ -69,7 +69,9 @@ struct Config
     int kernel_radius = 0; // zones included in the transport integral; zero means use the whole grid, N^2
     double initial_ring_mass = 1.0;
     double viscosity = 1.0 / 6.0;
-    // double n = 0.0; // viscosity profile; n=1/2 for alpha
+    // Viscosity law: if alpha_viscosity=true, nu(r) = viscosity * r^n
+    bool alpha_viscosity = false;
+    double n = 0.5; // exponent for alpha viscosity (n=0.5 is standard)
     double cpi = 1.0;
     double spi = 0.0;
     double tsi = 0.0;
@@ -80,13 +82,19 @@ struct Config
     std::vector<uint> sp = {};
     std::vector<uint> ts = {};
     std::string outdir = ".";
+    std::string fluct_pdf = "exponential";
+    double fluct_amax = 0.8;      // amplitude bound
+    double fluct_lambda = 0.3;    // exponential scale
+    double fluct_k = 2.0;         // gamma shape
+    double fluct_theta = 0.2;     // gamma scale
 };
 VISITABLE_STRUCT(Config,
     fold,
     kernel_radius,
     initial_ring_mass,
     viscosity,
-    // n,
+    alpha_viscosity,
+    n,
     cpi,
     spi,
     tsi,
@@ -96,7 +104,12 @@ VISITABLE_STRUCT(Config,
     domain,
     sp,
     ts,
-    outdir
+    outdir,
+    fluct_pdf,
+    fluct_amax,
+    fluct_lambda,
+    fluct_k,
+    fluct_theta
 );
 
 
@@ -109,7 +122,6 @@ struct State
 {
     double time;
     double iter;
-    // CHANGE: track total mass injected so it can be plotted and compared
     double mass_injected;
     double mass_accreted;
     double angm_accreted;
@@ -206,6 +218,22 @@ static double sample_symmetric_truncated_exponential(double amax, double lambda)
     return B(rng()) ? mag : -mag;
 }
 
+// Symmetric top-hat fluctuation in [-amax, +amax]
+static double sample_symmetric_tophat(double amax)
+{
+    std::uniform_real_distribution<double> U(-amax, +amax);
+    return U(rng());
+}
+
+// Symmetric gamma-like fluctuation: draw Gamma(k, theta), truncate at amax, assign random sign
+static double sample_symmetric_gamma(double k, double theta, double amax)
+{
+    std::gamma_distribution<double> G(k, theta);
+    double mag = std::min(G(rng()), amax);
+    std::uniform_int_distribution<int> B(0, 1);
+    return B(rng()) ? mag : -mag;
+}
+
 
 //
 // Equations for viscous spreading ring
@@ -220,16 +248,16 @@ static double sample_symmetric_truncated_exponential(double amax, double lambda)
 static HD double ring_sigma(double m, double r, double t, double r0, double nu)
 {
     if (m == 0.0 || t == 0.0) {
-        return SIGMA_FLOOR;
+        return 0.0; // no artificial floor to avoid spurious mass injection
     }
     double tau = 12.0 * nu * t / (r0 * r0);
     double x = r / r0;
     double z = 2.0 * x / tau;
     double prefac = m / (M_PI * r0 * r0 * tau * pow(x, 0.25));
     if (z < 10.0) {
-        return SIGMA_FLOOR + prefac * exp(-(1.0 + x * x) / tau) * besselij(0.25, z);
+        return prefac * exp(-(1.0 + x * x) / tau) * besselij(0.25, z);
     } else {
-        return SIGMA_FLOOR + prefac * exp(-(1.0 + x * x) / tau + z) / sqrt(2.0 * M_PI * z);
+        return prefac * exp(-(1.0 + x * x) / tau + z) / sqrt(2.0 * M_PI * z);
     }
 }
 
@@ -309,14 +337,39 @@ static void update_state(State& state, const Config& config)
 
     // NOTE (changed): injection location is currently fixed. Consider parameterizing.
     //auto injection_zone = num_zones / 10;
-    auto injection_zone = 229;
-    // CHANGE: baseline injection rate with zero-mean bounded random fluctuations
+    auto injection_zone = num_zones / 2;    
     auto base_mdot = 1.0;
-    auto fluct = sample_symmetric_truncated_exponential(0.8, 0.3);
+    double fluct = 0.0;
+    auto pdf = config.fluct_pdf;
+    if (pdf == "tophat") {
+        fluct = sample_symmetric_tophat(config.fluct_amax);
+    } else if (pdf == "gamma") {
+        fluct = sample_symmetric_gamma(config.fluct_k, config.fluct_theta, config.fluct_amax);
+    } else {
+        // default: exponential
+        fluct = sample_symmetric_truncated_exponential(config.fluct_amax, config.fluct_lambda);
+    }
     auto mdot = base_mdot * (1.0 + fluct);
 
-    auto rc = (J * J / M / M).cache();
-    auto dt = config.cfl * (rc * rc / (12.0 * nu))[0];
+    // Make rc robust: fallback to geometric cell radius if J^2/M^2 is invalid
+    auto rc_geom = range(rf.size() - 1).map([rf] (int i) { return 0.5 * (rf[i] + rf[i + 1]); }).cache();
+    auto rc = range(num_zones).map([J, M, rc_geom] (int i) {
+        // Avoid division by zero: only compute J^2/M^2 if M is sufficiently large
+        if (M[i] > 1e-30 && std::isfinite(M[i]) && std::isfinite(J[i])) {
+            double val = (J[i] * J[i]) / (M[i] * M[i]);
+            if (std::isfinite(val) && val > 0.0) {
+                return val;
+            }
+        }
+        return rc_geom[i];
+    }).cache();
+    
+    // Compute effective viscosity at innermost zone for timestep (use alpha law if enabled)
+    double nu_dt = nu;
+    if (config.alpha_viscosity) {
+        nu_dt = config.viscosity * pow(rc[0], config.n);
+    }
+    auto dt = config.cfl * (rc * rc / (12.0 * nu_dt))[0];
 
     auto injected_mass = range(num_zones).map([=] (int i) {
         if (i == injection_zone) {
@@ -336,11 +389,17 @@ static void update_state(State& state, const Config& config)
         }
     });
 
-    // CHANGE: fix accretion integral upper limit to rf[0] (inner boundary)
     auto mass_accreted = integrate([=] (double r) {
         auto s = 0.0;
         for (int j = 0; j < num_zones; ++j) {
-            s += 2 * M_PI * r * ring_sigma(M[j], r, dt, rc[j], nu);
+            // Skip rings with negligible mass or invalid radius to avoid NaN
+            if (M[j] > 1e-30 && std::isfinite(rc[j]) && rc[j] > 0.0) {
+                double nu_j = nu;
+                if (config.alpha_viscosity) {
+                    nu_j = config.viscosity * pow(rc[j], config.n);
+                }
+                s += 2 * M_PI * r * ring_sigma(M[j], r, dt, rc[j], nu_j);
+            }
         }
         return s;
     }, 0.0, rf[0]);
@@ -354,12 +413,18 @@ static void update_state(State& state, const Config& config)
         auto j0 = max2(i - kernel_radius, 0);
         auto j1 = min2(i + kernel_radius, num_zones);
         for (int j = j0; j < j1; ++j) {
-            s += ring_sigma(M[j], r, dt, rc[j], nu);
+            // Skip rings with negligible mass or invalid radius to avoid NaN
+            if (M[j] > 1e-30 && std::isfinite(rc[j]) && rc[j] > 0.0) {
+                double nu_j = nu;
+                if (config.alpha_viscosity) {
+                    nu_j = config.viscosity * pow(rc[j], config.n);
+                }
+                s += ring_sigma(M[j], r, dt, rc[j], nu_j);
+            }
         }
         return s;
     };
 
-    // CHANGE: outflow through the outer boundary estimated via conservation
     // New total mass before boundary accounting
     auto tentative_mass = range(num_zones).map([=] (int i) {
         return integrate([=] (double r) {
@@ -390,7 +455,6 @@ static void update_state(State& state, const Config& config)
     // Update the state with the new mass and angular momentum arrays
     state.mass = new_mass.cache();
     state.angm = new_angm.cache();
-    // CHANGE: accumulate mass injected in the timeseries
     state.mass_injected += mdot * dt;
     state.mass_accreted += mass_accreted;
     state.angm_accreted += angm_accreted;
