@@ -79,6 +79,7 @@ struct Config
     double tstart = 1.0;
     double tfinal = 1.0;
     vec_t<double, 3> domain = {0.1, 10.0, 0.1}; // inner, outer, step
+    double injection_radius = 1.0; // radius at which to inject mass
     std::vector<uint> sp = {};
     std::vector<uint> ts = {};
     std::string outdir = ".";
@@ -102,6 +103,7 @@ VISITABLE_STRUCT(Config,
     tstart,
     tfinal,
     domain,
+    injection_radius,
     sp,
     ts,
     outdir,
@@ -335,9 +337,15 @@ static void update_state(State& state, const Config& config)
     auto J = state.angm;
     auto kernel_radius = config.kernel_radius == 0 ? num_zones : config.kernel_radius;
 
-    // NOTE (changed): injection location is currently fixed. Consider parameterizing.
-    //auto injection_zone = num_zones / 10;
-    auto injection_zone = num_zones / 2;    
+    // Find the zone index closest to the configured injection radius
+    auto r_inj = config.injection_radius;
+    int injection_zone = 0;
+    for (int i = 0; i < num_zones; ++i) {
+        if (rf[i] <= r_inj && rf[i + 1] > r_inj) {
+            injection_zone = i;
+            break;
+        }
+    }
     auto base_mdot = 1.0;
     double fluct = 0.0;
     auto pdf = config.fluct_pdf;
@@ -382,7 +390,7 @@ static void update_state(State& state, const Config& config)
 
     auto injected_angm = range(num_zones).map([=] (int i) {
         if (i == injection_zone) {
-            return mdot * sqrt(rf[injection_zone]) * dt;
+            return mdot * sqrt(r_inj) * dt;
         }
         else {
             return 0.0;
@@ -425,17 +433,22 @@ static void update_state(State& state, const Config& config)
         return s;
     };
 
-    // New total mass before boundary accounting
-    auto tentative_mass = range(num_zones).map([=] (int i) {
-        return integrate([=] (double r) {
-            return 2 * M_PI * r * new_sigma(r, i);
-        }, rf[i], rf[i + 1]);
-    });
-    double total_mass_before = sum_array(M);
-    double total_mass_after  = sum_array(tentative_mass.cache());
-    double mass_loss_total   = total_mass_before - total_mass_after; // removed injected term
-    double mass_expelled = max2(mass_loss_total - mass_accreted, 0.0);
-    double angm_expelled = mass_expelled * sqrt(rf[num_zones]);
+    // Mass expelled beyond the outer boundary
+    auto mass_expelled = integrate([=] (double r) {
+        auto s = 0.0;
+        for (int j = 0; j < num_zones; ++j) {
+            if (M[j] > 1e-30 && std::isfinite(rc[j]) && rc[j] > 0.0) {
+                double nu_j = nu;
+                if (config.alpha_viscosity) {
+                    nu_j = config.viscosity * pow(rc[j], config.n);
+                }
+                s += 2 * M_PI * r * ring_sigma(M[j], r, dt, rc[j], nu_j);
+            }
+        }
+        return s;
+    }, rf[num_zones], rf[num_zones] * 2.0);
+
+    auto angm_expelled = mass_expelled * sqrt(rf[num_zones]);
 
     // Compute the new mass in each annulus
     auto new_mass = range(num_zones).map([=] (int i) {
