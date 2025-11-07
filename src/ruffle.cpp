@@ -76,10 +76,12 @@ struct Config
     double spi = 0.0;
     double tsi = 0.0;
     double cfl = 1.0;
+    double fixed_dt = 0.0;   // fixed timestep (0 = adaptive based on CFL)
     double tstart = 1.0;
     double tfinal = 1.0;
     vec_t<double, 3> domain = {0.1, 10.0, 0.1}; // inner, outer, step
     double injection_radius = 1.0; // radius at which to inject mass
+    double mass_injection_rate = 1.0; // mass injection rate (mass per time unit)
     std::vector<uint> sp = {};
     std::vector<uint> ts = {};
     std::string outdir = ".";
@@ -88,6 +90,11 @@ struct Config
     double fluct_lambda = 0.3;    // exponential scale
     double fluct_k = 2.0;         // gamma shape
     double fluct_theta = 0.2;     // gamma scale
+    double driving_period = 0.0;  // fixed period for sampling fluctuations (0 = every timestep)
+    bool use_ou_process = false;  // use Ornstein-Uhlenbeck process for driving
+    double ou_theta = 1.0;        // OU mean reversion rate (1/correlation_time)
+    double ou_mu = 0.0;           // OU long-term mean (fluctuation around mass_injection_rate)
+    double ou_sigma = 0.3;        // OU volatility (fluctuation amplitude)
 };
 VISITABLE_STRUCT(Config,
     fold,
@@ -100,10 +107,12 @@ VISITABLE_STRUCT(Config,
     spi,
     tsi,
     cfl,
+    fixed_dt,
     tstart,
     tfinal,
     domain,
     injection_radius,
+    mass_injection_rate,
     sp,
     ts,
     outdir,
@@ -111,7 +120,12 @@ VISITABLE_STRUCT(Config,
     fluct_amax,
     fluct_lambda,
     fluct_k,
-    fluct_theta
+    fluct_theta,
+    driving_period,
+    use_ou_process,
+    ou_theta,
+    ou_mu,
+    ou_sigma
 );
 
 
@@ -129,6 +143,8 @@ struct State
     double angm_accreted;
     double mass_expelled;
     double angm_expelled;
+    double current_fluct;      // current fluctuation value
+    double last_fluct_time;    // time when fluctuation was last sampled
     d_array_t mass;
     d_array_t angm;
 };
@@ -140,6 +156,8 @@ VISITABLE_STRUCT(State,
     angm_accreted,
     mass_expelled,
     angm_expelled,
+    current_fluct,
+    last_fluct_time,
     mass,
     angm
 );
@@ -346,18 +364,37 @@ static void update_state(State& state, const Config& config)
             break;
         }
     }
-    auto base_mdot = 1.0;
+    // Mass injection rate (mass per time unit), modulated by fluctuations
     double fluct = 0.0;
-    auto pdf = config.fluct_pdf;
-    if (pdf == "tophat") {
-        fluct = sample_symmetric_tophat(config.fluct_amax);
-    } else if (pdf == "gamma") {
-        fluct = sample_symmetric_gamma(config.fluct_k, config.fluct_theta, config.fluct_amax);
+    
+    if (config.use_ou_process) {
+        // Ornstein-Uhlenbeck process for continuous stochastic driving
+        // dX = theta * (mu - X) * dt + sigma * sqrt(dt) * N(0,1)
+        // This will be computed after dt is determined (see below)
     } else {
-        // default: exponential
-        fluct = sample_symmetric_truncated_exponential(config.fluct_amax, config.fluct_lambda);
+        // Discrete sampling at fixed intervals (original method)
+        // Sample new fluctuation only at fixed driving period intervals
+        // If driving_period == 0, sample every timestep (original behavior)
+        bool should_sample = (config.driving_period == 0.0) || 
+                             (state.time - state.last_fluct_time >= config.driving_period);
+        
+        if (should_sample) {
+            auto pdf = config.fluct_pdf;
+            if (pdf == "tophat") {
+                fluct = sample_symmetric_tophat(config.fluct_amax);
+            } else if (pdf == "gamma") {
+                fluct = sample_symmetric_gamma(config.fluct_k, config.fluct_theta, config.fluct_amax);
+            } else {
+                // default: exponential
+                fluct = sample_symmetric_truncated_exponential(config.fluct_amax, config.fluct_lambda);
+            }
+            state.current_fluct = fluct;
+            state.last_fluct_time = state.time;
+        } else {
+            // Use the existing fluctuation value
+            fluct = state.current_fluct;
+        }
     }
-    auto mdot = base_mdot * (1.0 + fluct);
 
     // Make rc robust: fallback to geometric cell radius if J^2/M^2 is invalid
     auto rc_geom = range(rf.size() - 1).map([rf] (int i) { return 0.5 * (rf[i] + rf[i + 1]); }).cache();
@@ -377,7 +414,41 @@ static void update_state(State& state, const Config& config)
     if (config.alpha_viscosity) {
         nu_dt = config.viscosity * pow(rc[0], config.n);
     }
-    auto dt = config.cfl * (rc * rc / (12.0 * nu_dt))[0];
+    
+    double dt;
+    if (config.fixed_dt > 0.0) {
+        // Use fixed timestep from config
+        dt = config.fixed_dt;
+        
+        // Check CFL condition and warn if violated (only on first iteration for efficiency)
+        if (state.iter == 0.0) {
+            double dt_cfl = config.cfl * (rc * rc / (12.0 * nu_dt))[0];
+            if (dt > dt_cfl) {
+                vapor::print("[warning] fixed_dt = ");
+                vapor::print(dt);
+                vapor::print(" exceeds CFL-limited dt = ");
+                vapor::print(dt_cfl);
+                vapor::print(" (may cause instability)\n");
+            }
+        }
+    } else {
+        // Adaptive timestep based on CFL condition
+        dt = config.cfl * (rc * rc / (12.0 * nu_dt))[0];
+    }
+    
+    // Update Ornstein-Uhlenbeck process if enabled
+    double mdot;
+    if (config.use_ou_process) {
+        // OU process: dX = theta * (mu - X) * dt + sigma * sqrt(dt) * N(0,1)
+        std::normal_distribution<double> N(0.0, 1.0);
+        double drift = config.ou_theta * (config.ou_mu - state.current_fluct) * dt;
+        double diffusion = config.ou_sigma * sqrt(dt) * N(rng());
+        state.current_fluct = state.current_fluct + drift + diffusion;
+        fluct = state.current_fluct;
+        mdot = config.mass_injection_rate * (1.0 + fluct);
+    } else {
+        mdot = config.mass_injection_rate * (1.0 + fluct);
+    }
 
     auto injected_mass = range(num_zones).map([=] (int i) {
         if (i == injection_zone) {
@@ -525,6 +596,9 @@ public:
         state.angm_accreted = 0.0;
         state.mass_expelled = 0.0;
         state.angm_expelled = 0.0;
+        // Initialize fluctuation: for OU process, start at mean; for discrete, start at zero
+        state.current_fluct = config.use_ou_process ? config.ou_mu : 0.0;
+        state.last_fluct_time = config.tstart;
     }
     void update(State& state) const override
     {
